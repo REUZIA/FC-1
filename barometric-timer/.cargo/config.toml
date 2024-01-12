@@ -1,0 +1,8 @@
+# set default build target for rp2040
+[build]
+target = "thumbv6m-none-eabi"
+# upload binary to rp2040 instead of running on host
+[target.thumbv6m-none-eabi]
+runner = "elf2uf2-rs -d"
+# use appropriate memory layout
+rustflags = ["-C", "link-arg=-Tlink.x"]
