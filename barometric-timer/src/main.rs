@@ -276,6 +276,9 @@ fn main() -> ! {
                     Err(_e) => {}
                     Ok(0) => {}
                     Ok(_) => {
+                        let mut text: String<64> = String::new();
+                        writeln!(&mut text, "> {}", buf[0] as char).unwrap();
+                        let _ = serial.write(text.as_bytes());
                         match buf[0] {
                             105 => { // i (info)
                                 let mut text: String<64> = String::new();
