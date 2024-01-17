@@ -275,7 +275,7 @@ fn main() -> ! {
                 match serial.read(&mut buf) {
                     Err(_e) => {}
                     Ok(0) => {}
-                    Ok(_) => {
+                    Ok(count) => {
                         let mut text: String<64> = String::new();
                         writeln!(&mut text, "> {}", buf[0] as char).unwrap();
                         let _ = serial.write(text.as_bytes());
@@ -328,15 +328,19 @@ fn main() -> ! {
                                 let _ = serial.write(b"Erasing completed!\r\n");
                             },
                             114 => { // r (read)
-                                let _ = serial.write(b"Reading file...\r\n");
                                 if file_system.files.is_empty() {
-                                    let _ = serial.write(b"No files to read\r\n");
+                                    let _ = serial.write(b"No files to read..\r\n");
                                     continue;
                                 }
-                                let file = file_system.files.last_mut().unwrap();
+                                let index = if count == 3 { buf[1] } else { file_system.files.len() as u8 - 1 };
+                                let mut text: String<64> = String::new();
+                                writeln!(&mut text, "Reading file {}|{}", index+1, file_system.files.len()).unwrap();
+                                let _ = serial.write(text.as_bytes());
+
+                                let file = file_system.files.get(index as usize).unwrap();
                                 let mut offset = 0;
                                 if file.size <= 0 {
-                                    let _ = serial.write(b"File is empty\r\n");
+                                    let _ = serial.write(b"File is empty..\r\n");
                                     continue;
                                 }
                                 loop {
@@ -348,12 +352,13 @@ fn main() -> ! {
                                                 UsbError::WouldBlock => {
                                                     ws.write(brightness(once(RGB8::new(0, 0, 255)), 80))
                                                         .unwrap();
+                                                    let _ = serial.write(b"\r\nError sending file");
                                                 },
                                                 _ => {
-                                                    let _ = serial.write(b"Error reading file\r\n");
-                                                    break;
+                                                    let _ = serial.write(b"\r\nError reading file");
                                                 }
                                             }
+                                            break;
                                         }
                                     }
                                     let _ = serial.write(b"\r\n");
@@ -361,7 +366,7 @@ fn main() -> ! {
                                     let _ = nb::block!(delay.wait());
                                     if offset >= file.size {
                                         let mut text: String<64> = String::new();
-                                        writeln!(&mut text, "write: {}", offset).unwrap();
+                                        writeln!(&mut text, "read: {} bytes", offset).unwrap();
                                         let _ = serial.write(text.as_bytes());
                                         break;
                                     }
