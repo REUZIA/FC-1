@@ -206,7 +206,7 @@ fn main() -> ! {
 
     let file_system = unsafe { FileSystem::init() };
     
-    let is_cli_mode = mode_selector.is_high().unwrap();
+    let is_cli_mode = mode_selector.is_low().unwrap();
     if is_cli_mode {
         cli_mode(pac.PIO0, pac.USBCTRL_REGS, pac.USBCTRL_DPRAM, &mut pac.RESETS, pins.neopixel, timer, &clocks.peripheral_clock, clocks.usb_clock, file_system)
     } else {
@@ -257,6 +257,8 @@ fn normal_mode(pac_pio0: pac::PIO0,
 
     let _ = file_system.create_new_file().unwrap();
 
+    ws.write(brightness(once(RGB8::new(0, 255, 0)), 100))
+        .unwrap();
     let mut n: usize = 0;
     let mut run_buffer = [0u8; PAGE_SIZE as usize];
     let mut delay = timer.count_down();
@@ -402,22 +404,27 @@ fn cli_mode(pac_pio0: pac::PIO0,
                                 let _ = serial.write(b"File is empty..\r\n");
                                 continue;
                             }
+                            let mut err_count = 0;
                             loop {
                                 let (buffer, size) = unsafe { FileSystem::read_relative_slice(&file, offset) };
                                 match serial.write(&buffer[0..size]) {
-                                    Ok(send_size) => {offset += send_size as u32;},
+                                    Ok(send_size) => {offset += send_size as u32;err_count = 0;}
                                     Err(e) => {
                                         match e {
                                             UsbError::WouldBlock => {
-                                                ws.write(brightness(once(RGB8::new(0, 0, 255)), 80))
-                                                    .unwrap();
-                                                let _ = serial.write(b"\r\nError sending file");
                                             },
                                             _ => {
                                                 let _ = serial.write(b"\r\nError reading file");
                                             }
                                         }
-                                        break;
+                                        if err_count > 10 {
+                                            ws.write(brightness(once(RGB8::new(0, 0, 255)), 80))
+                                                .unwrap();
+                                            let _ = serial.write(b"\r\nError sending file");
+                                            break;
+                                        }
+                                        delay.start(100.millis());
+                                        let _ = nb::block!(delay.wait());
                                     }
                                 }
                                 let _ = serial.write(b"\r\n");
@@ -454,7 +461,7 @@ fn cli_mode(pac_pio0: pac::PIO0,
                                 writeln!(&mut text, "test a: {}", r[0..256].iter().all(|c| *c == 97)).unwrap();
                                 let _ = serial.write(text.as_bytes());
                                 let mut text: String<64> = String::new();
-                                writeln!(&mut text, "test t: {}", r[256..512].iter().all(|c| *c == 116)).unwrap();
+                                writeln!(&mut text, "test b: {}", r[256..512].iter().all(|c| *c == 98)).unwrap();
                                 let _ = serial.write(text.as_bytes());
                             }
                             let _ = serial.write(b"PASSED\r\n");
