@@ -19,6 +19,7 @@ cortex-m = "0.7.7"
 usbd-serial = "0.1.1"
 usb-device = "0.2.9"
 bmp280-rs = "0.1.2"
+micromath = "2.1.0"
 
 [features]
 # This is the set of features we enable by default

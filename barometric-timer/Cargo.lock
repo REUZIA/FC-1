@@ -27,6 +27,7 @@ dependencies = [
  "embedded-hal",
  "fugit",
  "heapless",
+ "micromath",
  "nb 1.1.0",
  "panic-halt",
  "rp2040-boot2",
@@ -270,6 +271,12 @@ checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
 dependencies = [
  "either",
 ]
+
+[[package]]
+name = "micromath"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3c8dda44ff03a2f238717214da50f65d5a53b45cd213a7370424ffdb6fae815"
 
 [[package]]
 name = "nb"

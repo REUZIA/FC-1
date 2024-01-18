@@ -4,9 +4,11 @@
 mod rp_2040_lib;
 
 use core::iter::once;
-use embedded_hal::digital::v2::InputPin;
+use embedded_hal::prelude::_embedded_hal_blocking_delay_DelayMs;
+use embedded_hal::{digital::v2::InputPin, PwmPin};
 use embedded_hal::timer::CountDown;
 use fugit::{ExtU32, RateExtU32};
+use micromath::F32Ext;
 use panic_halt as _;
 use rp_2040_lib::{
     entry,
@@ -20,6 +22,7 @@ use rp_2040_lib::{
         Sio,
         usb::UsbBus,
         reset,
+        pwm,
         i2c
     },
     Pins,
@@ -47,6 +50,8 @@ const FLASH_SIZE: u32 = 2 * 1024 * 1024;
 const FILE_SYSTEM_BASE_META: u32 = XIP_BASE + FLASH_SIZE - SECTOR_SIZE;
 const FILE_SYSTEM_BASE: u32 = XIP_BASE + FLASH_SIZE - SECTOR_SIZE - 1;
 const PROGRAM_SIZE: u32 = SECTOR_SIZE * 30; // 120KB
+
+const ALTITUDE_THRESHOLD: f32 = 15.0_f32;
 
 #[repr(C)]
 struct FileSystem {
@@ -208,19 +213,41 @@ fn main() -> ! {
     
     let is_cli_mode = mode_selector.is_low().unwrap();
     if is_cli_mode {
-        cli_mode(pac.PIO0, pac.USBCTRL_REGS, pac.USBCTRL_DPRAM, &mut pac.RESETS, pins.neopixel, timer, &clocks.peripheral_clock, clocks.usb_clock, file_system)
+        cli_mode(pac.PIO0, 
+            pac.USBCTRL_REGS, 
+            pac.USBCTRL_DPRAM, 
+            &mut pac.RESETS, 
+            pins.neopixel, 
+            timer, 
+            &clocks.peripheral_clock, 
+            clocks.usb_clock, 
+            file_system
+        )
     } else {
-        normal_mode(pac.PIO0, &mut pac.RESETS, pac.I2C1, pins.gp2.reconfigure(), pins.gp3.reconfigure(), pins.neopixel,timer, &clocks.peripheral_clock, &clocks.system_clock, file_system)
+        normal_mode(pac.PIO0, pac.PWM, 
+            &mut pac.RESETS, 
+            mode_selector, 
+            pac.I2C1, pins.gp2.reconfigure(), 
+            pins.gp3.reconfigure(),
+            pins.neopixel,
+            pins.gp10, 
+            timer, 
+            &clocks.peripheral_clock, 
+            &clocks.system_clock, 
+            file_system)
     }
 }
 
 fn normal_mode(pac_pio0: pac::PIO0,
+    pac_pwm: pac::PWM,
     pac_resets: &mut pac::RESETS, 
+    modeselect_pin: gpio::Pin<gpio::bank0::Gpio26, gpio::FunctionSioInput, gpio::PullUp>,
     pac_i2c0: pac::I2C1,
     sda_pin: gpio::Pin<gpio::bank0::Gpio2, gpio::FunctionI2c, gpio::PullUp>,
     scl_pin: gpio::Pin<gpio::bank0::Gpio3, gpio::FunctionI2c, gpio::PullUp>,
     neopixel: gpio::Pin<gpio::bank0::Gpio16, gpio::FunctionNull, gpio::PullDown>,
-    timer: Timer, 
+    servo_pin: gpio::Pin<gpio::bank0::Gpio10, gpio::FunctionNull, gpio::PullDown>,
+    mut timer: Timer, 
     peripheral_clock: &PeripheralClock,
     system_clock: &SystemClock,
     mut file_system: FileSystem) -> ! {
@@ -237,6 +264,20 @@ fn normal_mode(pac_pio0: pac::PIO0,
     );
     ws.write(brightness(once(RGB8::new(255, 0, 0)), 100))
         .unwrap();
+
+    let mut pwm_slices = pwm::Slices::new(pac_pwm, pac_resets);
+    let pwm = &mut pwm_slices.pwm5;
+    pwm.clr_ph_correct(); // Not use phase correct PWM Datasheet 4.5.2.1
+    // Require 20ms period period(s) = ((TOP + 1) * (DIV_INT + DIV_FRAC / 256)) / fclk_MHz
+    pwm.set_top(65089);
+    pwm.set_div_int(3);
+    pwm.set_div_frac(11);
+    let servo_open: u16 = 1000 * 12 / (3+11/16); // Duty cycle 1000us
+    let servo_close: u16 = 1800 * 12 / (3+11/16); // Duty cycle 1800us
+    pwm.enable();
+    let servo_pwm = &mut pwm.channel_a;
+    servo_pwm.output_to(servo_pin);
+    servo_pwm.set_duty(servo_close);
 
     // Create the I²C drive, using the two pre-configured pins. This will fail
     // at compile time if the pins are in the wrong mode, or if this I²C
@@ -255,28 +296,66 @@ fn normal_mode(pac_pio0: pac::PIO0,
         .into_normal_mode(&mut i2c)
         .unwrap();
 
-    let _ = file_system.create_new_file().unwrap();
 
+    // FORCE DEPLOYEMENT
     ws.write(brightness(once(RGB8::new(0, 255, 0)), 100))
         .unwrap();
-    let mut n: usize = 0;
-    let mut run_buffer = [0u8; PAGE_SIZE as usize];
     let mut delay = timer.count_down();
+    delay.start(2.secs());
+    let _ = nb::block!(delay.wait());
+    if modeselect_pin.is_low().unwrap() {
+        servo_pwm.set_duty(servo_open);
+        loop {
+            servo_pwm.set_duty(servo_open);
+            // Turn off the LED (black)
+            ws.write(brightness(once(RGB8::new(0, 0, 0)), 0))
+                .unwrap();
+            delay.start(800.millis());
+            let _ = nb::block!(delay.wait());
+            servo_pwm.set_duty(servo_close);
+            // Turn on the LED (white)
+            ws.write(brightness(once(RGB8::new(255, 255, 255)), 100))
+                .unwrap();
+            delay.start(200.millis());
+            let _ = nb::block!(delay.wait());
+        }
+    }
+
+    // STANDBY / WAIT FOR LAUNCH
+    ws.write(brightness(once(RGB8::new(255, 0, 0)), 100))
+        .unwrap();
+    let _ = file_system.create_new_file().unwrap();
+    let mut buffer_index: usize = 0;
+    let mut circ_buffer = [0u8; PAGE_SIZE as usize];
+    let mut sea_level_pressure = 0;
     loop {
         let _ = bmp.read_temperature(&mut i2c).unwrap();
         let pressure = bmp.read_pressure(&mut i2c).unwrap();
-        run_buffer[n..n+4].copy_from_slice(&pressure.to_be_bytes());
-        n += 4;
-        if n >= 256 {
-            unsafe {
-                file_system.push_buffer(&run_buffer);
-            }
-            run_buffer = [0u8; PAGE_SIZE as usize];
-            n = 0;
+        if sea_level_pressure == 0 {
+            sea_level_pressure = pressure;
         }
-        
-        delay.start(10.millis());
-        let _ = nb::block!(delay.wait());
+        circ_buffer[buffer_index..buffer_index+4].copy_from_slice(&pressure.to_be_bytes());
+        buffer_index = (buffer_index + 4) % PAGE_SIZE as usize;
+        let altitude: f32 = 44330.0 * (1.0 - ((pressure as f32 )/ (sea_level_pressure as f32)).powf(0.1903));
+
+        if altitude > ALTITUDE_THRESHOLD {
+            break;
+        }
+
+        if (timer.get_counter().ticks() / 1_000) % 1_000 < 500 {
+            ws.write(brightness(once(RGB8::new(0, 255, 0)), 100))
+                .unwrap();
+        } else if (timer.get_counter().ticks() / 1_000) % 1000 >= 500 {
+            ws.write(brightness(once(RGB8::new(255, 0, 0)), 100))
+                .unwrap();
+        }
+    }
+
+    ws.write(brightness(once(RGB8::new(0, 0, 255)), 100))
+        .unwrap();
+
+    
+    loop {
     }
 }
 
@@ -351,7 +430,7 @@ fn cli_mode(pac_pio0: pac::PIO0,
                                 let _ = serial.write(text.as_bytes());
                             }
                             let mut text: String<64> = String::new();
-                            writeln!(text, "b={}", file_system.current_buffer_addr).unwrap();
+                            writeln!(text, "b={}|tick={}", file_system.current_buffer_addr, timer.get_counter().ticks()).unwrap();
                             let _ = serial.write(text.as_bytes());
 
                         },
