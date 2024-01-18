@@ -6,27 +6,31 @@ mod rp_2040_lib;
 use core::iter::once;
 use embedded_hal::digital::v2::InputPin;
 use embedded_hal::timer::CountDown;
-use fugit::ExtU32;
+use fugit::{ExtU32, RateExtU32};
 use panic_halt as _;
-use rp2040_hal::rom_data::connect_internal_flash;
-use rp_2040_lib::entry;
 use rp_2040_lib::{
+    entry,
     hal::{
-        clocks::{init_clocks_and_plls, Clock},
+        clocks::{init_clocks_and_plls, Clock, PeripheralClock, SystemClock, UsbClock},
         pac,
         pio::PIOExt,
+        gpio,
         timer::Timer,
         watchdog::Watchdog,
         Sio,
         usb::UsbBus,
-        reset
+        reset,
+        i2c
     },
-    Pins, XOSC_CRYSTAL_FREQ,
+    Pins,
+    XOSC_CRYSTAL_FREQ,
 };
 
 //Addressable LED imports
 use smart_leds::{brightness, SmartLedsWrite, RGB8};
 use ws2812_pio::Ws2812;
+//BMP280 imports
+use bmp280_rs::{BMP280, I2CAddress, Config};
 // USB imports
 use usb_device::{class_prelude::*, prelude::*};
 use usbd_serial::SerialPort;
@@ -176,7 +180,6 @@ impl File {
 #[entry]
 fn main() -> ! {
     let mut pac = pac::Peripherals::take().unwrap();
-
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
 
     let clocks = init_clocks_and_plls(
@@ -191,14 +194,117 @@ fn main() -> ! {
     .ok()
     .unwrap();
     let timer = Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
-    let mut delay = timer.count_down();
-    
-    let usb_bus = UsbBusAllocator::new(UsbBus::new(
-        pac.USBCTRL_REGS,
-        pac.USBCTRL_DPRAM,
-        clocks.usb_clock,
-        true,
+
+    let sio = Sio::new(pac.SIO);
+    let pins = Pins::new(
+        pac.IO_BANK0,
+        pac.PADS_BANK0,
+        sio.gpio_bank0,
         &mut pac.RESETS,
+    );
+    let mode_selector = pins.gp26.into_pull_up_input();
+
+    let file_system = unsafe { FileSystem::init() };
+    
+    let is_cli_mode = mode_selector.is_high().unwrap();
+    if is_cli_mode {
+        cli_mode(pac.PIO0, pac.USBCTRL_REGS, pac.USBCTRL_DPRAM, &mut pac.RESETS, pins.neopixel, timer, &clocks.peripheral_clock, clocks.usb_clock, file_system)
+    } else {
+        normal_mode(pac.PIO0, &mut pac.RESETS, pac.I2C1, pins.gp2.reconfigure(), pins.gp3.reconfigure(), pins.neopixel,timer, &clocks.peripheral_clock, &clocks.system_clock, file_system)
+    }
+}
+
+fn normal_mode(pac_pio0: pac::PIO0,
+    pac_resets: &mut pac::RESETS, 
+    pac_i2c0: pac::I2C1,
+    sda_pin: gpio::Pin<gpio::bank0::Gpio2, gpio::FunctionI2c, gpio::PullUp>,
+    scl_pin: gpio::Pin<gpio::bank0::Gpio3, gpio::FunctionI2c, gpio::PullUp>,
+    neopixel: gpio::Pin<gpio::bank0::Gpio16, gpio::FunctionNull, gpio::PullDown>,
+    timer: Timer, 
+    peripheral_clock: &PeripheralClock,
+    system_clock: &SystemClock,
+    mut file_system: FileSystem) -> ! {
+
+    // Configure the addressable LED
+    let (mut pio, sm0, _, _, _) = pac_pio0.split(pac_resets);
+    let mut ws = Ws2812::new(
+        // The onboard NeoPixel is attached to GPIO pin #16 on the Feather RP2040.
+        neopixel.into_function(),
+        &mut pio,
+        sm0,
+        peripheral_clock.freq(),
+        timer.count_down(),
+    );
+    ws.write(brightness(once(RGB8::new(255, 0, 0)), 100))
+        .unwrap();
+
+    // Create the I²C drive, using the two pre-configured pins. This will fail
+    // at compile time if the pins are in the wrong mode, or if this I²C
+    // peripheral isn't available on these pins!
+    let mut i2c = i2c::I2C::i2c1(
+        pac_i2c0,
+        sda_pin,
+        scl_pin, // Try `not_an_scl_pin` here
+        400.kHz(),
+        pac_resets,
+        system_clock,
+    );
+    // Create a BMP280 driver
+    let mut bmp = BMP280::new(&mut i2c, I2CAddress::SdoGrounded, Config::handheld_device_dynamic())
+        .unwrap()
+        .into_normal_mode(&mut i2c)
+        .unwrap();
+
+    let _ = file_system.create_new_file().unwrap();
+
+    let mut n: usize = 0;
+    let mut run_buffer = [0u8; PAGE_SIZE as usize];
+    let mut delay = timer.count_down();
+    loop {
+        let _ = bmp.read_temperature(&mut i2c).unwrap();
+        let pressure = bmp.read_pressure(&mut i2c).unwrap();
+        run_buffer[n..n+4].copy_from_slice(&pressure.to_be_bytes());
+        n += 4;
+        if n >= 256 {
+            unsafe {
+                file_system.push_buffer(&run_buffer);
+            }
+            run_buffer = [0u8; PAGE_SIZE as usize];
+            n = 0;
+        }
+        
+        delay.start(10.millis());
+        let _ = nb::block!(delay.wait());
+    }
+}
+
+fn cli_mode(pac_pio0: pac::PIO0,
+    pac_usbctrl_regs: pac::USBCTRL_REGS,
+    pac_usbctrl_dpram: pac::USBCTRL_DPRAM,
+    pac_resets: &mut pac::RESETS, 
+    neopixel: gpio::Pin<gpio::bank0::Gpio16, gpio::FunctionNull, gpio::PullDown>,
+    timer: Timer, 
+    peripheral_clock: &PeripheralClock,
+    usb_clock: UsbClock,
+    mut file_system: FileSystem) -> ! {
+
+    // Configure the addressable LED
+    let (mut pio, sm0, _, _, _) = pac_pio0.split(pac_resets);
+    let mut ws = Ws2812::new(
+        // The onboard NeoPixel is attached to GPIO pin #16 on the Feather RP2040.
+        neopixel.into_function(),
+        &mut pio,
+        sm0,
+        peripheral_clock.freq(),
+        timer.count_down(),
+    );
+
+    let usb_bus = UsbBusAllocator::new(UsbBus::new(
+        pac_usbctrl_regs,
+        pac_usbctrl_dpram,
+        usb_clock,
+        true,
+        pac_resets,
     ));
     // Use serial over USB
     let mut serial = SerialPort::new(&usb_bus);
@@ -210,203 +316,155 @@ fn main() -> ! {
         .device_class(2) // from: https://www.usb.org/defined-class-codes
         .build();
 
-    let sio = Sio::new(pac.SIO);
-    let pins = Pins::new(
-        pac.IO_BANK0,
-        pac.PADS_BANK0,
-        sio.gpio_bank0,
-        &mut pac.RESETS,
-    );
-    let mode_selector = pins.gp3.into_pull_down_input();
-
-    // Configure the addressable LED
-    let (mut pio, sm0, _, _, _) = pac.PIO0.split(&mut pac.RESETS);
-    let mut ws = Ws2812::new(
-        // The onboard NeoPixel is attached to GPIO pin #16 on the Feather RP2040.
-        pins.neopixel.into_function(),
-        &mut pio,
-        sm0,
-        clocks.peripheral_clock.freq(),
-        timer.count_down(),
-    );
-    ws.write(brightness(once(RGB8::new(255, 0, 0)), 100))
-        .unwrap();
-
-    
-    let mut file_system = unsafe { FileSystem::init() };
-    
     while timer.get_counter().ticks() < 1_000_000 {
         usb_dev.poll(&mut [&mut serial]);
     }
 
-    let is_cli_mode = mode_selector.is_high().unwrap();
-    if is_cli_mode {
-        ws.write(brightness(once(RGB8::new(255, 0, 255)), 80))
-            .unwrap();
-        let _ = serial.write(b"-- Running Baromiter timer CLI mode --\r\n");
-        usb_dev.poll(&mut [&mut serial]);
-    } else {
-        ws.write(brightness(once(RGB8::new(0, 255, 0)), 80))
-            .unwrap();
-        let _ = file_system.create_new_file().unwrap();
-    }
+    ws.write(brightness(once(RGB8::new(255, 0, 255)), 80))
+        .unwrap();
+    let _ = serial.write(b"-- Running Baromiter timer CLI mode --\r\n");
+    usb_dev.poll(&mut [&mut serial]);
 
-    // Infinite colour wheel loop
-    let mut n: u8 = 0;
-    let mut run_buffer = [0u8; PAGE_SIZE as usize];
+    let mut n = 97;
+    let mut delay = timer.count_down();
     loop {
-        if !is_cli_mode {
-            run_buffer[n as usize] = n;
-            
-            if n == 255 {
-                unsafe {
-                    file_system.push_buffer(&run_buffer);
-                }
-                run_buffer = [0u8; PAGE_SIZE as usize];
-            }
-            
-            n = n.wrapping_add(1);
-            delay.start(10.millis());
-            let _ = nb::block!(delay.wait());
-        } else {
-            // Check for new data
-            if usb_dev.poll(&mut [&mut serial]) {
-                let mut buf = [0u8; 64];
-                match serial.read(&mut buf) {
-                    Err(_e) => {}
-                    Ok(0) => {}
-                    Ok(count) => {
-                        let mut text: String<64> = String::new();
-                        writeln!(&mut text, "> {}", buf[0] as char).unwrap();
-                        let _ = serial.write(text.as_bytes());
-                        match buf[0] {
-                            105 => { // i (info)
+        // Check for new data
+        if usb_dev.poll(&mut [&mut serial]) {
+            let mut buf = [0u8; 64];
+            match serial.read(&mut buf) {
+                Err(_e) => {}
+                Ok(0) => {}
+                Ok(count) => {
+                    let mut text: String<64> = String::new();
+                    writeln!(&mut text, "> {}", buf[0] as char).unwrap();
+                    let _ = serial.write(text.as_bytes());
+                    match buf[0] {
+                        105 => { // i (info)
+                            let mut text: String<64> = String::new();
+                            writeln!(&mut text, "f={}", file_system.number_of_files).unwrap();
+                            let _ = serial.write(text.as_bytes());
+                            for (i, file) in file_system.files.iter().enumerate() {
                                 let mut text: String<64> = String::new();
-                                writeln!(&mut text, "f={}", file_system.number_of_files).unwrap();
+                                writeln!(&mut text, "{i}:a={}|s={}", file.address, file.size).unwrap();
                                 let _ = serial.write(text.as_bytes());
-                                for (i, file) in file_system.files.iter().enumerate() {
-                                    let mut text: String<64> = String::new();
-                                    writeln!(&mut text, "{i}:a={}|s={}", file.address, file.size).unwrap();
-                                    let _ = serial.write(text.as_bytes());
-                                }
-                                let mut text: String<64> = String::new();
-                                writeln!(text, "b={}", file_system.current_buffer_addr).unwrap();
-                                let _ = serial.write(text.as_bytes());
+                            }
+                            let mut text: String<64> = String::new();
+                            writeln!(text, "b={}", file_system.current_buffer_addr).unwrap();
+                            let _ = serial.write(text.as_bytes());
 
-                            },
-                            100 => { // d (delete)
-                                let _ = serial.write(b"Deleting all files..\r\n");
-                                unsafe { file_system.flush() };
-                                let _ = serial.write(b"Delete completed!\r\n");
-                            },
-                            110 => { // n (new file)
-                                let _ = serial.write(b"Creating new file..\r\n");
-                                file_system.create_new_file().unwrap();
-                                let mut text: String<64> = String::new();
-                                writeln!(&mut text, "New file at {}|Base={}!", file_system.files.last().unwrap().address, FILE_SYSTEM_BASE).unwrap();
-                                let _ = serial.write(text.as_bytes());
-                            },
-                            119 => { // w (write)
-                                let _ = serial.write(b"Writing to file..\r\n");
-                                if n < 97 || n > 122 {
-                                    n = 97;
-                                }
-                                let buff = [n; PAGE_SIZE as usize];
-                                unsafe { file_system.push_buffer(&buff) };
-                                n += 1;
-                                let _ = serial.write(&buff);
-                                let _ = serial.write(b"\r\nWrite completed!\r\n");
-                            },
-                            // e (erase flash)
-                            101 => {
-                                let _ = serial.write(b"Erasing flash..\r\n");
-                                unsafe { 
-                                    cortex_m::interrupt::free(|_cs| {
-                                        flash::flash_range_erase(FLASH_SIZE - 2*SECTOR_SIZE, SECTOR_SIZE, true);
-                                    }); 
-                                }
-                                let _ = serial.write(b"Erasing completed!\r\n");
-                            },
-                            114 => { // r (read)
-                                if file_system.files.is_empty() {
-                                    let _ = serial.write(b"No files to read..\r\n");
-                                    continue;
-                                }
-                                let index = if count == 3 { buf[1] } else { file_system.files.len() as u8 - 1 };
-                                let mut text: String<64> = String::new();
-                                writeln!(&mut text, "Reading file {}|{}", index+1, file_system.files.len()).unwrap();
-                                let _ = serial.write(text.as_bytes());
+                        },
+                        100 => { // d (delete)
+                            let _ = serial.write(b"Deleting all files..\r\n");
+                            unsafe { file_system.flush() };
+                            let _ = serial.write(b"Delete completed!\r\n");
+                        },
+                        110 => { // n (new file)
+                            let _ = serial.write(b"Creating new file..\r\n");
+                            file_system.create_new_file().unwrap();
+                            let mut text: String<64> = String::new();
+                            writeln!(&mut text, "New file at {}|Base={}!", file_system.files.last().unwrap().address, FILE_SYSTEM_BASE).unwrap();
+                            let _ = serial.write(text.as_bytes());
+                        },
+                        119 => { // w (write)
+                            let _ = serial.write(b"Writing to file..\r\n");
+                            if n < 97 || n > 122 {
+                                n = 97;
+                            }
+                            let buff = [n; PAGE_SIZE as usize];
+                            unsafe { file_system.push_buffer(&buff) };
+                            n += 1;
+                            let _ = serial.write(&buff);
+                            let _ = serial.write(b"\r\nWrite completed!\r\n");
+                        },
+                        // e (erase flash)
+                        101 => {
+                            let _ = serial.write(b"Erasing flash..\r\n");
+                            unsafe { 
+                                cortex_m::interrupt::free(|_cs| {
+                                    flash::flash_range_erase(FLASH_SIZE - 2*SECTOR_SIZE, SECTOR_SIZE, true);
+                                }); 
+                            }
+                            let _ = serial.write(b"Erasing completed!\r\n");
+                        },
+                        114 => { // r (read)
+                            if file_system.files.is_empty() {
+                                let _ = serial.write(b"No files to read..\r\n");
+                                continue;
+                            }
+                            let index = if count == 3 { buf[1] } else { file_system.files.len() as u8 - 1 };
+                            let mut text: String<64> = String::new();
+                            writeln!(&mut text, "Reading file {}|{}", index+1, file_system.files.len()).unwrap();
+                            let _ = serial.write(text.as_bytes());
 
-                                let file = file_system.files.get(index as usize).unwrap();
-                                let mut offset = 0;
-                                if file.size <= 0 {
-                                    let _ = serial.write(b"File is empty..\r\n");
-                                    continue;
-                                }
-                                loop {
-                                    let (buffer, size) = unsafe { FileSystem::read_relative_slice(&file, offset) };
-                                    match serial.write(&buffer[0..size]) {
-                                        Ok(send_size) => {offset += send_size as u32;},
-                                        Err(e) => {
-                                            match e {
-                                                UsbError::WouldBlock => {
-                                                    ws.write(brightness(once(RGB8::new(0, 0, 255)), 80))
-                                                        .unwrap();
-                                                    let _ = serial.write(b"\r\nError sending file");
-                                                },
-                                                _ => {
-                                                    let _ = serial.write(b"\r\nError reading file");
-                                                }
+                            let file = file_system.files.get(index as usize).unwrap();
+                            let mut offset = 0;
+                            if file.size <= 0 {
+                                let _ = serial.write(b"File is empty..\r\n");
+                                continue;
+                            }
+                            loop {
+                                let (buffer, size) = unsafe { FileSystem::read_relative_slice(&file, offset) };
+                                match serial.write(&buffer[0..size]) {
+                                    Ok(send_size) => {offset += send_size as u32;},
+                                    Err(e) => {
+                                        match e {
+                                            UsbError::WouldBlock => {
+                                                ws.write(brightness(once(RGB8::new(0, 0, 255)), 80))
+                                                    .unwrap();
+                                                let _ = serial.write(b"\r\nError sending file");
+                                            },
+                                            _ => {
+                                                let _ = serial.write(b"\r\nError reading file");
                                             }
-                                            break;
                                         }
-                                    }
-                                    let _ = serial.write(b"\r\n");
-                                    delay.start(10.millis());
-                                    let _ = nb::block!(delay.wait());
-                                    if offset >= file.size {
-                                        let mut text: String<64> = String::new();
-                                        writeln!(&mut text, "read: {} bytes", offset).unwrap();
-                                        let _ = serial.write(text.as_bytes());
                                         break;
                                     }
                                 }
-                            },
-                            116 => {// t (test)
-                                let _ = serial.write(b"Launch test: ");
-                                unsafe {
-                                    cortex_m::interrupt::free(|_cs| {
-                                        flash::flash_range_erase(FLASH_SIZE - 2*SECTOR_SIZE, SECTOR_SIZE, true);
-                                    }); 
-                                    let _ = serial.write(b"Erased\r\n");
-                                    for i in 0..16 {
-                                        let buff = [(97+i as u8); PAGE_SIZE as usize];
-                                        let mut text: String<64> = String::new();
-                                        writeln!(text, "Write: {} at {}", (97+i as u8) as char, XIP_BASE + FLASH_SIZE - 2*SECTOR_SIZE + i*PAGE_SIZE).unwrap();
-                                        let _ = serial.write(text.as_bytes());
-                                        cortex_m::interrupt::free(|_cs| {
-                                            flash::flash_range_program(FLASH_SIZE - 2*SECTOR_SIZE + i*PAGE_SIZE, &buff, true);
-                                        });
-                                    }
-                                    let _ = serial.write(b"Reading..\r\n");
-                                    let r = *((XIP_BASE + FLASH_SIZE - 2*SECTOR_SIZE) as *const [u8; SECTOR_SIZE as usize]);
-
+                                let _ = serial.write(b"\r\n");
+                                delay.start(10.millis());
+                                let _ = nb::block!(delay.wait());
+                                if offset >= file.size {
                                     let mut text: String<64> = String::new();
-                                    writeln!(&mut text, "test a: {}", r[0..256].iter().all(|c| *c == 97)).unwrap();
+                                    writeln!(&mut text, "read: {} bytes", offset).unwrap();
                                     let _ = serial.write(text.as_bytes());
-                                    let mut text: String<64> = String::new();
-                                    writeln!(&mut text, "test t: {}", r[256..512].iter().all(|c| *c == 116)).unwrap();
-                                    let _ = serial.write(text.as_bytes());
+                                    break;
                                 }
-                                let _ = serial.write(b"PASSED\r\n");
                             }
-                            113 => { // q (quit)
-                                let _ = serial.write(b"Quitting CLI mode\r\n");
-                                reset();
-                            },
-                            _ => {
-                                let _ = serial.write(b"Unknown command\r\n");
+                        },
+                        116 => {// t (test)
+                            let _ = serial.write(b"Launch test: ");
+                            unsafe {
+                                cortex_m::interrupt::free(|_cs| {
+                                    flash::flash_range_erase(FLASH_SIZE - 2*SECTOR_SIZE, SECTOR_SIZE, true);
+                                }); 
+                                let _ = serial.write(b"Erased\r\n");
+                                for i in 0..16 {
+                                    let buff = [(97+i as u8); PAGE_SIZE as usize];
+                                    let mut text: String<64> = String::new();
+                                    writeln!(text, "Write: {} at {}", (97+i as u8) as char, XIP_BASE + FLASH_SIZE - 2*SECTOR_SIZE + i*PAGE_SIZE).unwrap();
+                                    let _ = serial.write(text.as_bytes());
+                                    cortex_m::interrupt::free(|_cs| {
+                                        flash::flash_range_program(FLASH_SIZE - 2*SECTOR_SIZE + i*PAGE_SIZE, &buff, true);
+                                    });
+                                }
+                                let _ = serial.write(b"Reading..\r\n");
+                                let r = *((XIP_BASE + FLASH_SIZE - 2*SECTOR_SIZE) as *const [u8; SECTOR_SIZE as usize]);
+
+                                let mut text: String<64> = String::new();
+                                writeln!(&mut text, "test a: {}", r[0..256].iter().all(|c| *c == 97)).unwrap();
+                                let _ = serial.write(text.as_bytes());
+                                let mut text: String<64> = String::new();
+                                writeln!(&mut text, "test t: {}", r[256..512].iter().all(|c| *c == 116)).unwrap();
+                                let _ = serial.write(text.as_bytes());
                             }
+                            let _ = serial.write(b"PASSED\r\n");
+                        }
+                        113 => { // q (quit)
+                            let _ = serial.write(b"Quitting CLI mode\r\n");
+                            reset();
+                        },
+                        _ => {
+                            let _ = serial.write(b"Unknown command\r\n");
                         }
                     }
                 }
