@@ -4,7 +4,6 @@
 mod rp_2040_lib;
 
 use core::iter::once;
-use embedded_hal::prelude::_embedded_hal_blocking_delay_DelayMs;
 use embedded_hal::{digital::v2::InputPin, PwmPin};
 use embedded_hal::timer::CountDown;
 use fugit::{ExtU32, RateExtU32};
@@ -42,6 +41,13 @@ use core::fmt::Write;
 use heapless::{Vec, String};
 
 use rp2040_flash::flash;
+use littlefs2::{
+    driver::Storage,
+    consts::U256,
+    fs::Filesystem,
+    path::{Path, PathBuf},
+    io::SeekFrom,
+};
 const XIP_BASE: u32 = 0x10000000;
 const PAGE_SIZE: u32 = 256;
 const SECTOR_SIZE: u32 = 4 * 1024;
@@ -49,138 +55,81 @@ const FLASH_SIZE: u32 = 2 * 1024 * 1024;
 
 const FILE_SYSTEM_BASE_META: u32 = XIP_BASE + FLASH_SIZE - SECTOR_SIZE;
 const FILE_SYSTEM_BASE: u32 = XIP_BASE + FLASH_SIZE - SECTOR_SIZE - 1;
-const PROGRAM_SIZE: u32 = SECTOR_SIZE * 30; // 120KB
+const PROGRAM_SIZE: u32 = SECTOR_SIZE * 60; // 245KB
 
 const ALTITUDE_THRESHOLD: f32 = 15.0_f32;
 
-#[repr(C)]
-struct FileSystem {
-    number_of_files: u8,
-    files: Vec<File, 255>,
-    current_buffer_addr: u32,
-}
-impl FileSystem {
-    pub unsafe fn init() -> Self {
-        let number_of_files: u8 = *(FILE_SYSTEM_BASE_META as *const u8);
-        let mut files: Vec<File, 255> = Vec::new();
-        for i in 0..number_of_files {
-            let addr = FILE_SYSTEM_BASE_META + 1 + (i as usize * File::size_of()) as u32;
-            
-            files.push(File {
-                address: u32::from_le_bytes(*(addr as *const [u8; 4])),
-                size: u32::from_le_bytes(*((addr+4) as *const [u8; 4])),
-            }).unwrap();
+struct RpRom;
+impl Storage for RpRom {
+    type CACHE_SIZE = U256;
+    type LOOKAHEAD_SIZE = U256;
+
+    const READ_SIZE: usize = 256;
+    const WRITE_SIZE: usize = PAGE_SIZE as usize;
+    const BLOCK_SIZE: usize = SECTOR_SIZE as usize;
+    const BLOCK_COUNT: usize = (FLASH_SIZE-PROGRAM_SIZE / SECTOR_SIZE) as usize;
+    const BLOCK_CYCLES: isize = 1000;
+
+    fn read(&mut self, addr: usize, buf: &mut [u8]) -> Result<usize, littlefs2::io::Error> {
+        for i in 0..(buf.len() / PAGE_SIZE as usize) {
+            unsafe {
+                let read_buffer = *((addr as u32 + XIP_BASE + PROGRAM_SIZE) as *const [u8; PAGE_SIZE as usize]);
+                buf[(i*PAGE_SIZE as usize)..((i+1)*PAGE_SIZE as usize)].copy_from_slice(&read_buffer[..]);
+            }
         }
-        let current_buffer_addr = files.last().map_or(FILE_SYSTEM_BASE_META - PAGE_SIZE, |f| f.address - ((f.size / PAGE_SIZE)+1)*PAGE_SIZE + 1);
-        Self {
-            number_of_files,
-            files,
-            current_buffer_addr
-        }
+        Ok(buf.len())
     }
-
-    pub unsafe fn flush(&mut self) {
-        self.number_of_files = 0;
-        self.files.clear();
-        
-        let buffer = [0u8; SECTOR_SIZE as usize];
-        cortex_m::interrupt::free(|_cs| {
-            flash::flash_range_erase_and_program(FILE_SYSTEM_BASE_META - XIP_BASE, &buffer, true);
-        });
-    }
-
-    pub unsafe fn save_metedata(&self) {
-        let mut buffer = [0u8; SECTOR_SIZE as usize];
-        buffer[0] = self.number_of_files;
-
-        for (i, file) in self.files.iter().enumerate() {
-            let addr = 1 + (i as usize * File::size_of());
-            buffer[addr..addr+8].copy_from_slice(&file.to_bytes());
-        }
-
-        cortex_m::interrupt::free(|_cs| {
-            flash::flash_range_erase_and_program(FILE_SYSTEM_BASE_META - XIP_BASE, &buffer, true);
-        });
-    } 
-
-    pub fn create_new_file(&mut self) -> Option<()> {
-        if self.number_of_files == 255 {
-            return None;
-        }
-        let last_file = self.files.last().map_or(File { address: FILE_SYSTEM_BASE, size: 0 }, |f| *f);
-        let new_addr = last_file.address - last_file.size.div_ceil(SECTOR_SIZE)*SECTOR_SIZE;
-        if new_addr < XIP_BASE + PROGRAM_SIZE {
-            return None;
-        }
+    fn write(&mut self, addr: usize, buf: &[u8]) -> Result<usize, littlefs2::io::Error> {
         unsafe {
             cortex_m::interrupt::free(|_cs| {
-                flash::flash_range_erase(new_addr - XIP_BASE, SECTOR_SIZE, true);
-            }); 
+                flash::flash_range_program(addr as u32 + PROGRAM_SIZE, &buf, true);
+            });
         }
-        self.files.push(File {
-            address: new_addr,
-            size: 0,
-        }).unwrap();
-        self.number_of_files += 1;
-        self.current_buffer_addr = self.files.last().map_or(FILE_SYSTEM_BASE_META - PAGE_SIZE, |f| f.address - ((f.size / PAGE_SIZE)+1)*PAGE_SIZE + 1);
-        unsafe { self.save_metedata() };
-        Some(())
+        Ok(buf.len())
     }
-
-    pub unsafe fn push_buffer(&mut self, data: &[u8; PAGE_SIZE as usize]) {
-        if self.files.is_empty() {
-            return;
-        }
-        let file = self.files.last_mut().unwrap();
-        if file.size % SECTOR_SIZE == 0 {
-            let new_addr = file.address - ((file.size / SECTOR_SIZE)+1) * SECTOR_SIZE;
+    fn erase(&mut self, addr: usize, len: usize) -> Result<usize, littlefs2::io::Error> {
+        unsafe {
             cortex_m::interrupt::free(|_cs| {
-                flash::flash_range_erase(new_addr - XIP_BASE, SECTOR_SIZE, true);
-            }); 
+                flash::flash_range_erase(addr as u32 + PROGRAM_SIZE, len as u32, true);
+            });
         }
-        file.size += PAGE_SIZE;
-        
-        let mut rev_buffer = [0xff; PAGE_SIZE as usize];
-        rev_buffer.copy_from_slice(data);
-        rev_buffer.reverse();
-        cortex_m::interrupt::free(|_cs| {
-            flash::flash_range_program(self.current_buffer_addr as u32 - XIP_BASE, &rev_buffer, true);
-        });
-        self.current_buffer_addr -= PAGE_SIZE;
-        self.save_metedata();
-    }
-
-    pub unsafe fn read_relative_slice(file: &File, start_addr: u32) -> ([u8; PAGE_SIZE as usize], usize) {
-        let size = core::cmp::min(file.size - start_addr, PAGE_SIZE) as usize;
-        let addr = file.address - start_addr - PAGE_SIZE as u32 + 1;
-        
-        let mut read_buffer = unsafe { *(addr as *const [u8; PAGE_SIZE as usize]) };
-        read_buffer.reverse();
-    
-        let mut buffer = [0xffu8; PAGE_SIZE as usize];
-        buffer[0..size].copy_from_slice(&read_buffer[0..size]);
-        
-        (buffer, size)
+        Ok(len)
     }
 }
 
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-struct File {
-    address: u32,
-    size: u32,
+struct PWMParams {
+    sys_freq: u32,
+    top: u16,
+    div_int: u8,
+    div_frac: u8, // 4 bits
 }
-impl File {
-    pub fn size_of() -> usize {
-        core::mem::size_of::<File>()
+fn compute_pwm_params(sys_freq: u32, freq: u32) -> PWMParams {
+    let freq_count = freq * 65536;
+    let mut div_int = sys_freq / freq_count;
+    let mut div_frac = ((((sys_freq % freq_count) * 16) / freq_count) as f32).round() as u32;
+
+    if div_frac >= 16 {
+        div_int += 1;
+        div_frac = 0;
     }
-    pub fn to_bytes(&self) -> [u8; 8] {
-        let mut bytes = [0u8; 8];
-        bytes[0..4].copy_from_slice(self.address.to_le_bytes().as_ref());
-        bytes[4..8].copy_from_slice(self.size.to_le_bytes().as_ref());
-        bytes
+    PWMParams {
+        sys_freq,
+        top: 65535,
+        div_int: div_int as u8,
+        div_frac: div_frac as u8,
     }
 }
+fn get_count_from_us(us: u32, pwm_params: &PWMParams) -> u16 {
+    let count = (us * (pwm_params.sys_freq/1_000_000)) as f32 / (pwm_params.div_int as f32 + (pwm_params.div_frac/16) as f32);
+    let round = count.round() as u32;
+
+    if round >= 65536 {
+        65535
+    } else {
+        round as u16
+    }
+}
+
 
 #[entry]
 fn main() -> ! {
@@ -209,22 +158,31 @@ fn main() -> ! {
     );
     let mode_selector = pins.gp26.into_pull_up_input();
 
-    let file_system = unsafe { FileSystem::init() };
+    let mut storage = RpRom;
+
+    let mut alloc = Filesystem::allocate();
+    if !Filesystem::is_mountable(&mut storage) {
+        Filesystem::format(&mut storage).unwrap();
+    }
+    let fs = Filesystem::mount(&mut alloc, &mut storage).unwrap();
     
     let is_cli_mode = mode_selector.is_low().unwrap();
     if is_cli_mode {
         cli_mode(pac.PIO0, 
+            pac.PWM,
             pac.USBCTRL_REGS, 
             pac.USBCTRL_DPRAM, 
             &mut pac.RESETS, 
             pins.neopixel, 
+            pins.gp10,
             timer, 
             &clocks.peripheral_clock, 
             clocks.usb_clock, 
-            file_system
+            fs
         )
     } else {
-        normal_mode(pac.PIO0, pac.PWM, 
+        normal_mode(pac.PIO0, 
+            pac.PWM, 
             &mut pac.RESETS, 
             mode_selector, 
             pac.I2C1, pins.gp2.reconfigure(), 
@@ -234,7 +192,8 @@ fn main() -> ! {
             timer, 
             &clocks.peripheral_clock, 
             &clocks.system_clock, 
-            file_system)
+            fs
+        )
     }
 }
 
@@ -247,10 +206,10 @@ fn normal_mode(pac_pio0: pac::PIO0,
     scl_pin: gpio::Pin<gpio::bank0::Gpio3, gpio::FunctionI2c, gpio::PullUp>,
     neopixel: gpio::Pin<gpio::bank0::Gpio16, gpio::FunctionNull, gpio::PullDown>,
     servo_pin: gpio::Pin<gpio::bank0::Gpio10, gpio::FunctionNull, gpio::PullDown>,
-    mut timer: Timer, 
+    timer: Timer, 
     peripheral_clock: &PeripheralClock,
     system_clock: &SystemClock,
-    mut file_system: FileSystem) -> ! {
+    mut file_system: Filesystem<'_, RpRom>) -> ! {
 
     // Configure the addressable LED
     let (mut pio, sm0, _, _, _) = pac_pio0.split(pac_resets);
@@ -268,12 +227,13 @@ fn normal_mode(pac_pio0: pac::PIO0,
     let mut pwm_slices = pwm::Slices::new(pac_pwm, pac_resets);
     let pwm = &mut pwm_slices.pwm5;
     pwm.clr_ph_correct(); // Not use phase correct PWM Datasheet 4.5.2.1
-    // Require 20ms period period(s) = ((TOP + 1) * (DIV_INT + DIV_FRAC / 256)) / fclk_MHz
-    pwm.set_top(65089);
-    pwm.set_div_int(3);
-    pwm.set_div_frac(11);
-    let servo_open: u16 = 1000 * 12 / (3+11/16); // Duty cycle 1000us
-    let servo_close: u16 = 1800 * 12 / (3+11/16); // Duty cycle 1800us
+    // Require 20ms period period(s) = ((TOP + 1) * (DIV_INT + DIV_FRAC / 16)) / fclk_MHz
+    let pwm_params = compute_pwm_params(peripheral_clock.freq().to_Hz(), 50);
+    pwm.set_top(pwm_params.top);
+    pwm.set_div_int(pwm_params.div_int);
+    pwm.set_div_frac(pwm_params.div_frac);
+    let servo_open: u16 = get_count_from_us(1000, &pwm_params); // Duty cycle 1000us
+    let servo_close: u16 = get_count_from_us(1800, &pwm_params); // Duty cycle 1000us
     pwm.enable();
     let servo_pwm = &mut pwm.channel_a;
     servo_pwm.output_to(servo_pin);
@@ -296,6 +256,15 @@ fn normal_mode(pac_pio0: pac::PIO0,
         .into_normal_mode(&mut i2c)
         .unwrap();
 
+    file_system.read_dir_and_then(
+        &Path::from_str_with_nul("/\0"),
+        |dirs| {
+            let mut text: String<64> = String::new();
+            write!(&mut text, "run_{}\0", dirs.count()).unwrap();
+            file_system.create_dir(&Path::from_str_with_nul(text.as_str())).unwrap();
+            Ok(())
+        },
+    ).unwrap();
 
     // FORCE DEPLOYEMENT
     ws.write(brightness(once(RGB8::new(0, 255, 0)), 100))
@@ -306,13 +275,11 @@ fn normal_mode(pac_pio0: pac::PIO0,
     if modeselect_pin.is_low().unwrap() {
         servo_pwm.set_duty(servo_open);
         loop {
-            servo_pwm.set_duty(servo_open);
             // Turn off the LED (black)
             ws.write(brightness(once(RGB8::new(0, 0, 0)), 0))
                 .unwrap();
             delay.start(800.millis());
             let _ = nb::block!(delay.wait());
-            servo_pwm.set_duty(servo_close);
             // Turn on the LED (white)
             ws.write(brightness(once(RGB8::new(255, 255, 255)), 100))
                 .unwrap();
@@ -324,7 +291,6 @@ fn normal_mode(pac_pio0: pac::PIO0,
     // STANDBY / WAIT FOR LAUNCH
     ws.write(brightness(once(RGB8::new(255, 0, 0)), 100))
         .unwrap();
-    let _ = file_system.create_new_file().unwrap();
     let mut buffer_index: usize = 0;
     let mut circ_buffer = [0u8; PAGE_SIZE as usize];
     let mut sea_level_pressure = 0;
@@ -353,21 +319,22 @@ fn normal_mode(pac_pio0: pac::PIO0,
 
     ws.write(brightness(once(RGB8::new(0, 0, 255)), 100))
         .unwrap();
-
     
     loop {
     }
 }
 
 fn cli_mode(pac_pio0: pac::PIO0,
+    pac_pwm: pac::PWM,
     pac_usbctrl_regs: pac::USBCTRL_REGS,
     pac_usbctrl_dpram: pac::USBCTRL_DPRAM,
     pac_resets: &mut pac::RESETS, 
     neopixel: gpio::Pin<gpio::bank0::Gpio16, gpio::FunctionNull, gpio::PullDown>,
+    servo_pin: gpio::Pin<gpio::bank0::Gpio10, gpio::FunctionNull, gpio::PullDown>,
     timer: Timer, 
     peripheral_clock: &PeripheralClock,
     usb_clock: UsbClock,
-    mut file_system: FileSystem) -> ! {
+    mut file_system: Filesystem<'_, RpRom>) -> ! {
 
     // Configure the addressable LED
     let (mut pio, sm0, _, _, _) = pac_pio0.split(pac_resets);
@@ -401,6 +368,20 @@ fn cli_mode(pac_pio0: pac::PIO0,
         usb_dev.poll(&mut [&mut serial]);
     }
 
+    let mut pwm_slices = pwm::Slices::new(pac_pwm, pac_resets);
+    let pwm = &mut pwm_slices.pwm5;
+    pwm.clr_ph_correct(); // Not use phase correct PWM Datasheet 4.5.2.1
+    // Require 20ms period period(s) = ((TOP + 1) * (DIV_INT + DIV_FRAC / 16)) / fclk_MHz
+    let pwm_params = compute_pwm_params(peripheral_clock.freq().to_Hz(), 50);
+    pwm.set_top(pwm_params.top);
+    pwm.set_div_int(pwm_params.div_int);
+    pwm.set_div_frac(pwm_params.div_frac);
+    let servo_open: u16 = get_count_from_us(1000, &pwm_params); // Duty cycle 1000us
+    pwm.enable();
+    let servo_pwm = &mut pwm.channel_a;
+    servo_pwm.output_to(servo_pin);
+    servo_pwm.set_duty(servo_open);
+
     ws.write(brightness(once(RGB8::new(255, 0, 255)), 80))
         .unwrap();
     let _ = serial.write(b"-- Running Baromiter timer CLI mode --\r\n");
@@ -421,105 +402,94 @@ fn cli_mode(pac_pio0: pac::PIO0,
                     let _ = serial.write(text.as_bytes());
                     match buf[0] {
                         105 => { // i (info)
+                            let used_percentage: f32 = 1.0 - (file_system.available_space().unwrap() as f32) / file_system.total_space() as f32;
                             let mut text: String<64> = String::new();
-                            writeln!(&mut text, "f={}", file_system.number_of_files).unwrap();
+                            writeln!(&mut text, "used={}%", used_percentage).unwrap();
                             let _ = serial.write(text.as_bytes());
-                            for (i, file) in file_system.files.iter().enumerate() {
-                                let mut text: String<64> = String::new();
-                                writeln!(&mut text, "{i}:a={}|s={}", file.address, file.size).unwrap();
-                                let _ = serial.write(text.as_bytes());
-                            }
-                            let mut text: String<64> = String::new();
-                            writeln!(text, "b={}|tick={}", file_system.current_buffer_addr, timer.get_counter().ticks()).unwrap();
-                            let _ = serial.write(text.as_bytes());
+                            text.clear();
 
+                            file_system.read_dir_and_then(
+                                &Path::from_str_with_nul("/\0"),
+                                |dirs| {
+                                    for dir in dirs {
+                                        let dir = dir.unwrap();
+
+                                        let mut text: String<64> = String::new();
+                                        if dir.file_type().is_file() {
+                                            writeln!(&mut text, "file:{}", dir.path().as_str_ref_with_trailing_nul()).unwrap();
+                                        } else {
+                                            writeln!(&mut text, "dir:{}", dir.path().as_str_ref_with_trailing_nul()).unwrap();
+                                        }
+                                        let _ = serial.write(text.as_bytes());
+                                    }
+                                    Ok(())
+                                },
+                            ).unwrap();
                         },
                         100 => { // d (delete)
                             let _ = serial.write(b"Deleting all files..\r\n");
-                            unsafe { file_system.flush() };
+                            file_system.remove_dir_all(&Path::from_str_with_nul("/\0")).unwrap();
                             let _ = serial.write(b"Delete completed!\r\n");
                         },
-                        110 => { // n (new file)
-                            let _ = serial.write(b"Creating new file..\r\n");
-                            file_system.create_new_file().unwrap();
-                            let mut text: String<64> = String::new();
-                            writeln!(&mut text, "New file at {}|Base={}!", file_system.files.last().unwrap().address, FILE_SYSTEM_BASE).unwrap();
-                            let _ = serial.write(text.as_bytes());
-                        },
-                        119 => { // w (write)
-                            let _ = serial.write(b"Writing to file..\r\n");
-                            if n < 97 || n > 122 {
-                                n = 97;
+                        110 => { // n (new)
+                            match file_system.create_dir(&Path::from_str_with_nul("test\0")) {
+                                Ok(()) => {
+                                    let _ = serial.write(b"Created dir!\r\n");
+                                },
+                                Err(err) => {
+                                    let mut text: String<64> = String::new();
+                                    writeln!(&mut text, "Fail create dir err: {:?}", err).unwrap();
+                                    let _ = serial.write(text.as_bytes());
+                                }
                             }
-                            let buff = [n; PAGE_SIZE as usize];
-                            unsafe { file_system.push_buffer(&buff) };
-                            n += 1;
-                            let _ = serial.write(&buff);
-                            let _ = serial.write(b"\r\nWrite completed!\r\n");
-                        },
-                        // e (erase flash)
-                        101 => {
-                            let _ = serial.write(b"Erasing flash..\r\n");
-                            unsafe { 
-                                cortex_m::interrupt::free(|_cs| {
-                                    flash::flash_range_erase(FLASH_SIZE - 2*SECTOR_SIZE, SECTOR_SIZE, true);
-                                }); 
+                            file_system.open_file_with_options_and_then(
+                                |options| options.read(true).write(true).create(true),
+                                &PathBuf::from(b"example.txt"),
+                                |file| {
+                                    file.write(&[110; 1024])?;
+                                    // file.seek(SeekFrom::Start(0)).unwrap();
+                                    // assert_eq!(file.read(&mut bright)?, 1);
+                                    Ok(())
+                                }
+                            ).unwrap();
+                            match file_system.remove_dir(&Path::from_str_with_nul("test\0")) {
+                                Ok(()) => {
+                                    let _ = serial.write(b"Remove dir!\r\n");
+                                },
+                                Err(err) => {
+                                    let mut text: String<64> = String::new();
+                                    writeln!(&mut text, "Fail remove dir err: {:?}", err).unwrap();
+                                    let _ = serial.write(text.as_bytes());
+                                }
                             }
-                            let _ = serial.write(b"Erasing completed!\r\n");
                         },
                         114 => { // r (read)
-                            if file_system.files.is_empty() {
-                                let _ = serial.write(b"No files to read..\r\n");
-                                continue;
-                            }
-                            let index = if count == 3 { buf[1] } else { file_system.files.len() as u8 - 1 };
-                            let mut text: String<64> = String::new();
-                            writeln!(&mut text, "Reading file {}|{}", index+1, file_system.files.len()).unwrap();
-                            let _ = serial.write(text.as_bytes());
-
-                            let file = file_system.files.get(index as usize).unwrap();
-                            let mut offset = 0;
-                            if file.size <= 0 {
-                                let _ = serial.write(b"File is empty..\r\n");
-                                continue;
-                            }
-                            let mut err_count = 0;
-                            loop {
-                                let (buffer, size) = unsafe { FileSystem::read_relative_slice(&file, offset) };
-                                match serial.write(&buffer[0..size]) {
-                                    Ok(send_size) => {offset += send_size as u32;err_count = 0;}
-                                    Err(e) => {
-                                        match e {
-                                            UsbError::WouldBlock => {
-                                            },
-                                            _ => {
-                                                let _ = serial.write(b"\r\nError reading file");
-                                            }
-                                        }
-                                        if err_count > 10 {
-                                            ws.write(brightness(once(RGB8::new(0, 0, 255)), 80))
-                                                .unwrap();
-                                            let _ = serial.write(b"\r\nError sending file");
-                                            break;
-                                        }
-                                        delay.start(100.millis());
-                                        let _ = nb::block!(delay.wait());
-                                    }
+                            let mut buff = [0u8; 64];
+                            let mut read_length = 0;
+                            match file_system.open_file_with_options_and_then(
+                                |options| options.read(true),
+                                &PathBuf::from(b"example.txt"),
+                                |file| {
+                                    file.seek(SeekFrom::Start(0)).unwrap();
+                                    read_length = file.read(&mut buff).unwrap();
+                                    Ok(())
                                 }
-                                let _ = serial.write(b"\r\n");
-                                delay.start(10.millis());
-                                let _ = nb::block!(delay.wait());
-                                if offset >= file.size {
+                            ) {
+                                Ok(()) => {
+                                    let _ = serial.write(b"Read: ");
+                                    let _ = serial.write(&buff[0..read_length]);
+                                    let _ = serial.write(b"\r\n");
+                                },
+                                Err(err) => {
                                     let mut text: String<64> = String::new();
-                                    writeln!(&mut text, "read: {} bytes", offset).unwrap();
+                                    writeln!(&mut text, "Fail read err: {:?}", err).unwrap();
                                     let _ = serial.write(text.as_bytes());
-                                    break;
                                 }
                             }
                         },
                         116 => {// t (test)
                             let _ = serial.write(b"Launch test: ");
-                            unsafe {
+                            /* unsafe {
                                 cortex_m::interrupt::free(|_cs| {
                                     flash::flash_range_erase(FLASH_SIZE - 2*SECTOR_SIZE, SECTOR_SIZE, true);
                                 }); 
@@ -542,7 +512,7 @@ fn cli_mode(pac_pio0: pac::PIO0,
                                 let mut text: String<64> = String::new();
                                 writeln!(&mut text, "test b: {}", r[256..512].iter().all(|c| *c == 98)).unwrap();
                                 let _ = serial.write(text.as_bytes());
-                            }
+                            } */
                             let _ = serial.write(b"PASSED\r\n");
                         }
                         113 => { // q (quit)

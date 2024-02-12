@@ -20,6 +20,7 @@ usbd-serial = "0.1.1"
 usb-device = "0.2.9"
 bmp280-rs = "0.1.2"
 micromath = "2.1.0"
+littlefs2 = "0.4.0"
 
 [features]
 # This is the set of features we enable by default
@@ -46,3 +47,6 @@ disable-intrinsics = ["rp2040-hal/disable-intrinsics"]
 
 # This enables ROM functions for f64 math that were not present in the earliest RP2040s
 rom-v2-intrinsics = ["rp2040-hal/rom-v2-intrinsics"]
+
+[patch.crates-io]
+delog = {git = "https://github.com/LechevSpace/delog.git", rev = "869167f7ff0630518c86f30afd215fee124d19c1"}
