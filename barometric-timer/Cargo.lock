@@ -48,6 +48,7 @@ dependencies = [
  "bmp280-rs",
  "cortex-m",
  "cortex-m-rt",
+ "critical-section",
  "embedded-alloc",
  "embedded-hal",
  "fugit",

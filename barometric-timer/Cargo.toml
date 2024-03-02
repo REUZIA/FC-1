@@ -22,6 +22,7 @@ bmp280-rs = "0.1.2"
 micromath = "2.1.0"
 littlefs2 = "0.4.0"
 embedded-alloc = "0.5.1"
+critical-section = "1.1.2"
 
 [features]
 # This is the set of features we enable by default
