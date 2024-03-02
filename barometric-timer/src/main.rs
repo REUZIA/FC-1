@@ -6,16 +6,16 @@ mod rp_2040_lib;
 use core::iter::once;
 use embedded_hal::timer::CountDown;
 use embedded_hal::{digital::v2::InputPin, PwmPin};
-use fugit::{ExtU32, MicrosDurationU32, RateExtU32, Rate};
+use fugit::{ExtU32, MicrosDurationU32, Rate, RateExtU32};
 use micromath::F32Ext;
 use panic_halt as _;
 use rp_2040_lib::{
     entry,
     hal::{
         clocks::{init_clocks_and_plls, Clock, PeripheralClock, SystemClock, UsbClock},
-        pio,
         gpio, i2c,
         pac::{self, interrupt},
+        pio,
         pio::PIOExt,
         pwm, reset,
         timer::{Alarm, Timer},
@@ -59,7 +59,6 @@ const PAGE_SIZE: u32 = 256;
 const SECTOR_SIZE: u32 = 4 * 1024;
 const FLASH_SIZE: u32 = 2 * 1024 * 1024;
 const PROGRAM_SIZE: u32 = SECTOR_SIZE * 64; // 262KB
-
 
 struct RpRom;
 impl Storage for RpRom {
@@ -162,7 +161,9 @@ fn main() -> ! {
     let mut timer = Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
 
     critical_section::with(|cs| {
-        TIMER_AND_CLOCK.borrow(cs).replace(Some((timer, clocks.peripheral_clock.freq())));
+        TIMER_AND_CLOCK
+            .borrow(cs)
+            .replace(Some((timer, clocks.peripheral_clock.freq())));
     });
 
     let sio = Sio::new(pac.SIO);
@@ -262,7 +263,7 @@ impl<'a> Logger<'a> {
             if dir_count > 9999 {
                 panic!("Too many runs, please clear the storage");
             }
-            write!(&mut run_path, "run_{}", dir_count-1).unwrap();
+            write!(&mut run_path, "run_{}", dir_count - 1).unwrap();
             Ok(())
         })
         .unwrap();
@@ -274,7 +275,7 @@ impl<'a> Logger<'a> {
         };
         log.write_event_log("LOG ATTACHED");
         log
-    } 
+    }
 
     pub fn write_event_log(&mut self, log: &str) {
         // Baked log path for farter execution
@@ -514,7 +515,7 @@ fn normal_mode<'a>(
         circ_buffer[buffer_head_index + 1] = pressure as u32;
         circ_buffer[buffer_head_index + 2] = altitude.to_bits();
 
-        buffer_head_index = (buffer_head_index + 3) % BUFFER_MAX_LEN*3 as usize;
+        buffer_head_index = (buffer_head_index + 3) % BUFFER_MAX_LEN * 3 as usize;
         if buffer_len < BUFFER_MAX_LEN as usize {
             buffer_len += 3;
         };
@@ -536,7 +537,7 @@ fn normal_mode<'a>(
         .unwrap();
 
     logger.write_event_log("SETUP BACKUP TIMER");
-    critical_section::with(|_| { 
+    critical_section::with(|_| {
         timer_alarm.clear_interrupt();
         timer_alarm.schedule(MAX_DELAY).unwrap();
         timer_alarm.enable_interrupt();
@@ -550,7 +551,11 @@ fn normal_mode<'a>(
     logger.write_event_log("SAVE CIRCULAR BUFFER");
     for i in ((buffer_head_index - buffer_len)..buffer_head_index).step_by(3) {
         let i = i % BUFFER_MAX_LEN;
-        logger.write_bmp_log(circ_buffer[i] as i32, circ_buffer[i + 1] as i32, f32::from_bits(circ_buffer[i + 2]));
+        logger.write_bmp_log(
+            circ_buffer[i] as i32,
+            circ_buffer[i + 1] as i32,
+            f32::from_bits(circ_buffer[i + 2]),
+        );
     }
 
     logger.write_event_log("START MAIN LOOP");
