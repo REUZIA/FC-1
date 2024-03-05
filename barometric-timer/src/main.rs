@@ -15,7 +15,6 @@ use rp_2040_lib::{
         clocks::{init_clocks_and_plls, Clock, PeripheralClock, SystemClock, UsbClock},
         gpio, i2c,
         pac::{self, interrupt},
-        pio,
         pio::PIOExt,
         pwm, reset,
         timer::{Alarm, Timer},
@@ -36,7 +35,7 @@ use core::fmt::Write;
 use usb_device::{class_prelude::*, prelude::*};
 use usbd_serial::SerialPort;
 // IRQ imports
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use critical_section::Mutex;
 
 use embedded_alloc::Heap;
@@ -46,59 +45,13 @@ static HEAP: Heap = Heap::empty();
 extern crate alloc;
 use alloc::{string::String, vec::Vec};
 
+mod rom;
 use littlefs2::{
-    consts::U256,
-    driver::Storage,
     fs::{FileType, Filesystem},
     io::SeekFrom,
     path::Path,
 };
-use rp2040_flash::flash;
-const XIP_BASE: u32 = 0x10000000;
-const PAGE_SIZE: u32 = 256;
-const SECTOR_SIZE: u32 = 4 * 1024;
-const FLASH_SIZE: u32 = 2 * 1024 * 1024;
-const PROGRAM_SIZE: u32 = SECTOR_SIZE * 64; // 262KB
-
-struct RpRom;
-impl Storage for RpRom {
-    type CACHE_SIZE = U256;
-    type LOOKAHEAD_SIZE = U256;
-
-    const READ_SIZE: usize = 256;
-    const WRITE_SIZE: usize = PAGE_SIZE as usize;
-    const BLOCK_SIZE: usize = SECTOR_SIZE as usize;
-    const BLOCK_COUNT: usize = (FLASH_SIZE - PROGRAM_SIZE / SECTOR_SIZE) as usize;
-    const BLOCK_CYCLES: isize = 1000;
-
-    fn read(&mut self, addr: usize, buf: &mut [u8]) -> Result<usize, littlefs2::io::Error> {
-        for i in 0..(buf.len() / PAGE_SIZE as usize) {
-            unsafe {
-                let read_buffer =
-                    *((addr as u32 + XIP_BASE + PROGRAM_SIZE) as *const [u8; PAGE_SIZE as usize]);
-                buf[(i * PAGE_SIZE as usize)..((i + 1) * PAGE_SIZE as usize)]
-                    .copy_from_slice(&read_buffer[..]);
-            }
-        }
-        Ok(buf.len())
-    }
-    fn write(&mut self, addr: usize, buf: &[u8]) -> Result<usize, littlefs2::io::Error> {
-        unsafe {
-            cortex_m::interrupt::free(|_cs| {
-                flash::flash_range_program(addr as u32 + PROGRAM_SIZE, &buf, true);
-            });
-        }
-        Ok(buf.len())
-    }
-    fn erase(&mut self, addr: usize, len: usize) -> Result<usize, littlefs2::io::Error> {
-        unsafe {
-            cortex_m::interrupt::free(|_cs| {
-                flash::flash_range_erase(addr as u32 + PROGRAM_SIZE, len as u32, true);
-            });
-        }
-        Ok(len)
-    }
-}
+use rom::RpRom;
 
 struct PWMParams {
     sys_freq: u32,
@@ -133,6 +86,22 @@ fn get_count_from_us(us: u32, pwm_params: &PWMParams) -> u16 {
         round as u16
     }
 }
+
+// Constants
+const BUFFER_MAX_LEN: usize = 32;
+const MAX_DELAY: MicrosDurationU32 = MicrosDurationU32::minutes(2);
+
+const ALTITUDE_THRESHOLD: f32 = 0.0_f32;
+const VERTICAL_SPEED_THRESHOLD: f32 = 3.0;
+const VERTICAL_SPEED_AVG_WINDOW: usize = 15;
+
+const TOUCHDOWN_APOAPSIS_OFFSET: f32 = 10.0;
+const SPEED_TOUCHDOWN_THRESHOLD: f32 = 1.0;
+
+const SERIAL_BUFFER_SIZE: usize = 64;
+const BUFFER_READ_SIZE: usize = 64;
+
+static IS_DEPLOYED: Mutex<Cell<bool>> = Mutex::new(Cell::new(false));
 
 #[entry]
 fn main() -> ! {
@@ -324,6 +293,34 @@ impl<'a> Logger<'a> {
                     temp_str.push(b'|');
                     temp_str.extend_from_slice(&temp.to_le_bytes());
                     temp_str.extend_from_slice(&pressure.to_le_bytes());
+                    temp_str.extend_from_slice(&altitude.to_be_bytes());
+                    temp_str.push(b'\0');
+                    file.write(&temp_str)?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+
+    pub fn write_speed_log(&mut self, speed: f32) {
+        // Baked log path for farter execution
+        if self.baked_log_path.is_empty() {
+            let mut temp_path: String = String::new();
+            write!(&mut temp_path, "{}/log\0", self.run_path).unwrap();
+            self.baked_log_path = temp_path;
+        }
+
+        self.fs
+            .open_file_with_options_and_then(
+                |options| options.read(true).append(true).create(true),
+                &Path::from_str_with_nul(self.baked_log_path.as_str()),
+                |file| {
+                    let mut temp_str = Vec::<u8>::new();
+                    temp_str.push(FrameLog::BMP as u8);
+                    temp_str.push(b'|');
+                    temp_str.extend_from_slice(&self.timer.get_counter().ticks().to_le_bytes());
+                    temp_str.push(b'|');
+                    temp_str.extend_from_slice(&speed.to_be_bytes());
                     temp_str.push(b'\0');
                     file.write(&temp_str)?;
                     Ok(())
@@ -340,6 +337,10 @@ static TIMER_AND_CLOCK: Mutex<RefCell<Option<TimerAndClock>>> = Mutex::new(RefCe
 fn TIMER_IRQ_1() {
     let mut timerclock: Option<(Timer, Rate<u32, 1, 1>)> = None;
     critical_section::with(|cs| {
+        if IS_DEPLOYED.borrow(cs).get() {
+            return;
+        }
+
         // Temporarily take our LED_AND_ALARM
         timerclock = TIMER_AND_CLOCK.borrow(cs).take();
     });
@@ -393,6 +394,9 @@ fn TIMER_IRQ_1() {
         servo_pwm.set_duty(get_count_from_us(1000, &pwm_params)); // Open Servo
 
         logger.write_event_log("FORCED DEPLOYEMENT");
+        critical_section::with(|cs| {
+            IS_DEPLOYED.borrow(cs).set(true);
+        });
     }
     // WARNING: NO JUMP BACK !! (don't know why ?)
 }
@@ -412,10 +416,6 @@ fn normal_mode<'a>(
     system_clock: &SystemClock,
     file_system: &'a Filesystem<'a, RpRom>,
 ) {
-    const BUFFER_MAX_LEN: usize = 32;
-    const MAX_DELAY: MicrosDurationU32 = MicrosDurationU32::minutes(2);
-    const ALTITUDE_THRESHOLD: f32 = 0.0_f32;
-
     let mut timer_alarm = timer.alarm_1().unwrap();
 
     // Configure the addressable LED
@@ -481,6 +481,9 @@ fn normal_mode<'a>(
     if modeselect_pin.is_low().unwrap() {
         servo_pwm.set_duty(servo_open);
         logger.write_event_log("FORCED DEPLOYEMENT");
+        critical_section::with(|cs| {
+            IS_DEPLOYED.borrow(cs).set(true);
+        });
         loop {
             // Turn off the LED (black)
             ws.write(brightness(once(RGB8::new(0, 0, 0)), 0)).unwrap();
@@ -559,10 +562,77 @@ fn normal_mode<'a>(
     }
 
     logger.write_event_log("START MAIN LOOP");
-    loop {}
+    let mut circ_buffer = [(0u64, 0f32); VERTICAL_SPEED_AVG_WINDOW];
+    buffer_head_index = 0;
+    buffer_len = 0;
+    let mut apoapsis = 0.0f32;
+    while !critical_section::with(|cs| IS_DEPLOYED.borrow(cs).get()) {
+        let temp = bmp.read_temperature(&mut i2c).unwrap();
+        let pressure = bmp.read_pressure(&mut i2c).unwrap();
+        let altitude: f32 =
+            44330.0 * (1.0 - ((pressure as f32) / (sea_level_pressure as f32)).powf(0.1903));
+        logger.write_bmp_log(temp, pressure, altitude);
+
+        circ_buffer[buffer_head_index] = (timer.get_counter().ticks(), altitude);
+        buffer_head_index = (buffer_head_index + 1) % VERTICAL_SPEED_AVG_WINDOW;
+        if buffer_len < VERTICAL_SPEED_AVG_WINDOW {
+            buffer_len += 1;
+        }
+        if buffer_len <= 2 {
+            continue;
+        }
+
+        let mean_speed = circ_buffer
+            .windows(2)
+            .map(|arr| (arr[1].1 - arr[0].1) / (arr[1].0 - arr[0].0) as f32)
+            .sum::<f32>()
+            / (VERTICAL_SPEED_AVG_WINDOW - 1) as f32;
+        logger.write_speed_log(mean_speed);
+
+        if mean_speed < VERTICAL_SPEED_THRESHOLD {
+            apoapsis = altitude;
+            break;
+        }
+    }
+    if !critical_section::with(|cs| IS_DEPLOYED.borrow(cs).get()) {
+        logger.write_event_log("DEPLOYED BY ALTI");
+        servo_pwm.set_duty(servo_open);
+    }
+
+    buffer_head_index = 0;
+    buffer_len = 0;
+    loop {
+        let temp = bmp.read_temperature(&mut i2c).unwrap();
+        let pressure = bmp.read_pressure(&mut i2c).unwrap();
+        let altitude: f32 =
+            44330.0 * (1.0 - ((pressure as f32) / (sea_level_pressure as f32)).powf(0.1903));
+        logger.write_bmp_log(temp, pressure, altitude);
+
+        circ_buffer[buffer_head_index] = (timer.get_counter().ticks(), altitude);
+        buffer_head_index = (buffer_head_index + 1) % VERTICAL_SPEED_AVG_WINDOW;
+        if buffer_len < VERTICAL_SPEED_AVG_WINDOW {
+            buffer_len += 1;
+        }
+        if buffer_len <= 2 {
+            continue;
+        }
+
+        let mean_speed = circ_buffer
+            .windows(2)
+            .map(|arr| (arr[1].1 - arr[0].1) / (arr[1].0 - arr[0].0) as f32)
+            .sum::<f32>()
+            / (VERTICAL_SPEED_AVG_WINDOW - 1) as f32;
+        logger.write_speed_log(mean_speed);
+
+        if altitude < (apoapsis - TOUCHDOWN_APOAPSIS_OFFSET)
+            && mean_speed < SPEED_TOUCHDOWN_THRESHOLD
+        {
+            logger.write_event_log("TOUCHDOWN");
+            break;
+        }
+    }
 }
 
-const SERIAL_BUFFER_SIZE: usize = 64;
 fn cli_mode(
     pac_pio0: pac::PIO0,
     pac_pwm: pac::PWM,
@@ -766,7 +836,6 @@ fn cli_mode(
                             let mut string_path = String::from_utf8(bytes_path.to_vec()).unwrap();
                             string_path.push('\0');
 
-                            const BUFFER_READ_SIZE: usize = 64;
                             let mut buff = [0u8; BUFFER_READ_SIZE];
                             file_system
                                 .open_file_with_options_and_then(
