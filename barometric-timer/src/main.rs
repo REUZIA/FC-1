@@ -1,6 +1,15 @@
 #![no_std]
 #![no_main]
 
+/*!
+This crate is the rust Embedded code for a barometric timer using a rp2040 microcontroller.
+
+## Design Notes
+
+There is two modes to use this firmware. The normal mode where it should act as a barometric timer and the CLI mode where you can connect the microcontroller and access to the filesystem via basic function calling using Serial Communication.
+
+Author: Nicolas THIERRY (SiERA for [Air Esiea](https://airesiea.org/))
+!*/
 mod rp_2040_lib;
 
 use core::iter::once;
@@ -53,13 +62,15 @@ use littlefs2::{
 };
 use rom::RpRom;
 
-struct PWMParams {
+/// Store parameters for the PWM setup. Used as return for the compute_pwm_params function.
+pub struct PWMParams {
     sys_freq: u32,
     top: u16,
     div_int: u8,
     div_frac: u8, // 4 bits
 }
-fn compute_pwm_params(sys_freq: u32, freq: u32) -> PWMParams {
+/// Get the PWM parameters for a given wanted frequency and a system frequency.
+pub fn compute_pwm_params(sys_freq: u32, freq: u32) -> PWMParams {
     let freq_count = freq * 65536;
     let mut div_int = sys_freq / freq_count;
     let mut div_frac = ((((sys_freq % freq_count) * 16) / freq_count) as f32).round() as u32;
@@ -75,6 +86,7 @@ fn compute_pwm_params(sys_freq: u32, freq: u32) -> PWMParams {
         div_frac: div_frac as u8,
     }
 }
+/// Get counter value from the wanted duration in us and setup parameters.
 fn get_count_from_us(us: u32, pwm_params: &PWMParams) -> u16 {
     let count = (us * (pwm_params.sys_freq / 1_000_000)) as f32
         / (pwm_params.div_int as f32 + (pwm_params.div_frac / 16) as f32);
@@ -88,19 +100,36 @@ fn get_count_from_us(us: u32, pwm_params: &PWMParams) -> u16 {
 }
 
 // Constants
+/// Length of the circular buffer used in the main loop of normal mode.
 const BUFFER_MAX_LEN: usize = 32;
-const MAX_DELAY: MicrosDurationU32 = MicrosDurationU32::minutes(2);
+/// Delay after which backup interrupt is triggered to deploy parachute after launch detection.
+const MAX_DELAY: MicrosDurationU32 = MicrosDurationU32::millis(4500);
 
-const ALTITUDE_THRESHOLD: f32 = 0.0_f32;
+/// Minimum altitude variation to detect a launch.
+const ALTITUDE_THRESHOLD: f32 = 15.0_f32;
+/// Minimum vertical speed below which the paracute will be triggered. Meaning we are close to
+/// apoapsis.
 const VERTICAL_SPEED_THRESHOLD: f32 = 3.0;
+/// Size of mean window for vertical speed.
 const VERTICAL_SPEED_AVG_WINDOW: usize = 15;
 
-const TOUCHDOWN_APOAPSIS_OFFSET: f32 = 10.0;
+/// Distance to wait from the apoapsis before starting trying to detect touchdown speed. Else, low
+/// apoapsis vertical speed could immediatly triggered touchdown detection.
+const TOUCHDOWN_APOAPSIS_OFFSET: f32 = 15.0;
+/// Speed below which touchdown should be detect.
 const SPEED_TOUCHDOWN_THRESHOLD: f32 = 1.0;
 
+/// Size of buffer use for serial bus communication.
 const SERIAL_BUFFER_SIZE: usize = 64;
+/// Size of buffer use to read files in memory.
 const BUFFER_READ_SIZE: usize = 64;
 
+/// Duration of the servo open command.
+const SERVO_OPEN_US: u32 = 1000;
+/// Duration of the servo close command.
+const SERVO_CLOSE_US: u32 = 1800;
+
+/// Is parachute open command has been already issued.
 static IS_DEPLOYED: Mutex<Cell<bool>> = Mutex::new(Cell::new(false));
 
 #[entry]
@@ -129,6 +158,7 @@ fn main() -> ! {
     .unwrap();
     let mut timer = Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
 
+    // Save timer and clock for later use in the interrupt.
     critical_section::with(|cs| {
         TIMER_AND_CLOCK
             .borrow(cs)
@@ -185,9 +215,10 @@ fn main() -> ! {
         &fs,
     );
 
-    loop {}
+    rp2040_hal::halt();
 }
 
+/// Log type. Is use as u8 start byte of log frame.
 enum FrameLog {
     Event = 1,
     BMP = 2,
@@ -199,6 +230,7 @@ struct Logger<'a> {
     baked_log_path: String,
 }
 impl<'a> Logger<'a> {
+    /// Create new instance of Logger and create a new directory to store run logs.
     pub fn new(fs: &'a Filesystem<'a, RpRom>, timer: &'a Timer) -> Self {
         let mut run_path: String = String::new();
         // Create a new dir for the current run
@@ -225,6 +257,7 @@ impl<'a> Logger<'a> {
         log
     }
 
+    /// Create new instance of Logger and attach it to already existing run logs.
     pub fn from_current(fs: &'a Filesystem<'a, RpRom>, timer: &'a Timer) -> Self {
         let mut run_path: String = String::new();
         fs.read_dir_and_then(&Path::from_str_with_nul("/\0"), |dirs| {
@@ -242,7 +275,7 @@ impl<'a> Logger<'a> {
             run_path,
             baked_log_path: String::new(),
         };
-        log.write_event_log("LOG ATTACHED");
+        log.write_event_log("LOGGER ATTACHED");
         log
     }
 
@@ -332,7 +365,7 @@ impl<'a> Logger<'a> {
 
 type TimerAndClock = (Timer, Rate<u32, 1, 1>);
 static TIMER_AND_CLOCK: Mutex<RefCell<Option<TimerAndClock>>> = Mutex::new(RefCell::new(None));
-// Interrupt Triggered by the Alarm1 of TIMER
+/// Interrupt Triggered by the Alarm1 of TIMER
 #[interrupt]
 fn TIMER_IRQ_1() {
     let mut timerclock: Option<(Timer, Rate<u32, 1, 1>)> = None;
@@ -383,15 +416,16 @@ fn TIMER_IRQ_1() {
         let mut pwm_slices = pwm::Slices::new(pac.PWM, &mut pac.RESETS);
         let pwm = &mut pwm_slices.pwm5;
         pwm.clr_ph_correct(); // Not use phase correct PWM Datasheet 4.5.2.1
-                              // Require 20ms period period(s) = ((TOP + 1) * (DIV_INT + DIV_FRAC / 16)) / fclk_MHz
+
         let pwm_params = compute_pwm_params(peripheral_clock_freq.to_Hz(), 50);
         pwm.set_top(pwm_params.top);
         pwm.set_div_int(pwm_params.div_int);
         pwm.set_div_frac(pwm_params.div_frac);
         pwm.enable();
+
         let servo_pwm = &mut pwm.channel_a;
         servo_pwm.output_to(pins.gp10);
-        servo_pwm.set_duty(get_count_from_us(1000, &pwm_params)); // Open Servo
+        servo_pwm.set_duty(get_count_from_us(SERVO_OPEN_US, &pwm_params)); // Open Servo
 
         logger.write_event_log("FORCED DEPLOYEMENT");
         critical_section::with(|cs| {
@@ -434,14 +468,15 @@ fn normal_mode<'a>(
     let mut pwm_slices = pwm::Slices::new(pac_pwm, pac_resets);
     let pwm = &mut pwm_slices.pwm5;
     pwm.clr_ph_correct(); // Not use phase correct PWM Datasheet 4.5.2.1
-                          // Require 20ms period period(s) = ((TOP + 1) * (DIV_INT + DIV_FRAC / 16)) / fclk_MHz
+
     let pwm_params = compute_pwm_params(peripheral_clock.freq().to_Hz(), 50);
     pwm.set_top(pwm_params.top);
     pwm.set_div_int(pwm_params.div_int);
     pwm.set_div_frac(pwm_params.div_frac);
-    let servo_open: u16 = get_count_from_us(1000, &pwm_params); // Duty cycle 1000us
-    let servo_close: u16 = get_count_from_us(1800, &pwm_params); // Duty cycle 1000us
+    let servo_open: u16 = get_count_from_us(SERVO_OPEN_US, &pwm_params); // Duty cycle 1000us
+    let servo_close: u16 = get_count_from_us(SERVO_CLOSE_US, &pwm_params); // Duty cycle 1000us
     pwm.enable();
+
     let servo_pwm = &mut pwm.channel_a;
     servo_pwm.output_to(servo_pin);
     servo_pwm.set_duty(servo_close);
@@ -475,9 +510,11 @@ fn normal_mode<'a>(
     // FORCE DEPLOYEMENT
     ws.write(brightness(once(RGB8::new(0, 255, 0)), 100))
         .unwrap();
+    
     let mut delay = timer.count_down();
     delay.start(2.secs());
     let _ = nb::block!(delay.wait());
+
     if modeselect_pin.is_low().unwrap() {
         servo_pwm.set_duty(servo_open);
         logger.write_event_log("FORCED DEPLOYEMENT");
@@ -668,9 +705,9 @@ fn cli_mode(
     let mut serial = SerialPort::new(&usb_bus);
     // Create a USB device with a fake VID and PID
     let mut usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x16c0, 0x27dd))
-        .manufacturer("Fake company")
-        .product("Serial port")
-        .serial_number("PI_PICO")
+        .manufacturer("Air Esia")
+        .product("Barometric Timer")
+        .serial_number("BT01")
         .device_class(2) // from: https://www.usb.org/defined-class-codes
         .build();
 
