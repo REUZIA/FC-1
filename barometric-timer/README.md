@@ -1,5 +1,7 @@
 ## Barometric Timer
 
+This timer provide two modes. By default, it run the normal mode which act as a barometric timer and log the sensor data into its file system. But by connecting the pin .. to 3v3 before powering the board, it run the CLI mode. In this second mode you can run multiple commands via a Serial connection (or use Python script to extract the file data).
+
 ## Normal mode
 
 ## CLI mode
