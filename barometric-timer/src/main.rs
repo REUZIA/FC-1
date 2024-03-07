@@ -13,11 +13,11 @@ Author: Nicolas THIERRY (SiERA for [Air Esiea](https://airesiea.org/))
 mod rp_2040_lib;
 
 use core::iter::once;
+use core::panic::PanicInfo;
 use embedded_hal::timer::CountDown;
 use embedded_hal::{digital::v2::InputPin, PwmPin};
 use fugit::{ExtU32, MicrosDurationU32, Rate, RateExtU32};
 use micromath::F32Ext;
-use panic_halt as _;
 use rp_2040_lib::{
     entry,
     hal::{
@@ -131,6 +131,100 @@ const SERVO_CLOSE_US: u32 = 1800;
 
 /// Is parachute open command has been already issued.
 static IS_DEPLOYED: Mutex<Cell<bool>> = Mutex::new(Cell::new(false));
+
+/// Custom panic handler. It will write the panic message in a file in the filesystem (if possible) and then
+/// do a fast red blink with the builtin LED.
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    let mut pac = unsafe { pac::Peripherals::steal() };
+    let mut watchdog = Watchdog::new(pac.WATCHDOG);
+
+    let clocks = init_clocks_and_plls(
+        XOSC_CRYSTAL_FREQ,
+        pac.XOSC,
+        pac.CLOCKS,
+        pac.PLL_SYS,
+        pac.PLL_USB,
+        &mut pac.RESETS,
+        &mut watchdog,
+    )
+    .ok()
+    .unwrap();
+    let timer = Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
+
+    let sio = Sio::new(pac.SIO);
+    let pins = Pins::new(
+        pac.IO_BANK0,
+        pac.PADS_BANK0,
+        sio.gpio_bank0,
+        &mut pac.RESETS,
+    );
+
+    // Configure the addressable LED
+    let (mut pio, sm0, _, _, _) = pac.PIO0.split(&mut pac.RESETS);
+    let mut ws = Ws2812::new(
+        // The onboard NeoPixel is attached to GPIO pin #16 on the Feather RP2040.
+        pins.neopixel.into_function(),
+        &mut pio,
+        sm0,
+        clocks.peripheral_clock.freq(),
+        timer.count_down(),
+    );
+
+    let mut storage = RpRom;
+    let mut alloc = Filesystem::allocate();
+    if !Filesystem::is_mountable(&mut storage) {
+        let _ = Filesystem::format(&mut storage);
+    }
+    let _ = Filesystem::mount(&mut alloc, &mut storage).and_then(|fs| {
+        let mut panic_path: String = String::new();
+        fs.read_dir_and_then(&Path::from_str_with_nul("/\0"), |dirs| {
+            let dir_count = dirs.count() - 2; // -2 because of /. and /..
+            if dir_count > 9999 {
+                return Err(littlefs2::io::Error::NoSpace);
+            }
+            if dir_count <= 0 {
+                match write!(&mut panic_path, "run_{}\0", dir_count - 1) {
+                    Ok(_) => Ok(()),
+                    Err(_) => Err(littlefs2::io::Error::Io),
+                }?;
+
+                fs.create_dir(&Path::from_str_with_nul(&panic_path))
+                    .unwrap();
+                panic_path.clear();
+            }
+            match write!(&mut panic_path, "run_{}/panic\0", dir_count - 1) {
+                Ok(_) => Ok(()),
+                Err(_) => Err(littlefs2::io::Error::Io),
+            }
+        })?;
+
+        fs.open_file_with_options_and_then(
+            |options| options.read(true).append(true).create(true),
+            &Path::from_str_with_nul(panic_path.as_str()),
+            |file| {
+                let mut err_msg = String::new();
+                let _ = write!(&mut err_msg, "Panic: {:?}", info);
+                file.write(err_msg.as_bytes())?;
+                Ok(())
+            },
+        )?;
+
+        Ok(())
+    });
+
+    let mut delay = timer.count_down();
+    loop {
+        // Turn off the LED (black)
+        let _ = ws.write(brightness(once(RGB8::new(0, 0, 0)), 0));
+        delay.start(200.millis());
+        let _ = nb::block!(delay.wait());
+        // Turn on the LED (white)
+        let _ = ws.write(brightness(once(RGB8::new(255, 0, 0)), 100));
+        delay.start(200.millis());
+        let _ = nb::block!(delay.wait());
+    }
+}
 
 #[entry]
 fn main() -> ! {
@@ -369,11 +463,11 @@ static TIMER_AND_CLOCK: Mutex<RefCell<Option<TimerAndClock>>> = Mutex::new(RefCe
 #[interrupt]
 fn TIMER_IRQ_1() {
     let mut timerclock: Option<(Timer, Rate<u32, 1, 1>)> = None;
-    critical_section::with(|cs| {
-        if IS_DEPLOYED.borrow(cs).get() {
-            return;
-        }
+    if critical_section::with(|cs| IS_DEPLOYED.borrow(cs).get()) {
+        return;
+    }
 
+    critical_section::with(|cs| {
         // Temporarily take our LED_AND_ALARM
         timerclock = TIMER_AND_CLOCK.borrow(cs).take();
     });
@@ -427,10 +521,8 @@ fn TIMER_IRQ_1() {
         servo_pwm.output_to(pins.gp10);
         servo_pwm.set_duty(get_count_from_us(SERVO_OPEN_US, &pwm_params)); // Open Servo
 
-        logger.write_event_log("FORCED DEPLOYEMENT");
-        critical_section::with(|cs| {
-            IS_DEPLOYED.borrow(cs).set(true);
-        });
+        logger.write_event_log("BACKUP DEPLOYEMENT");
+        critical_section::with(|cs| IS_DEPLOYED.borrow(cs).set(true));
     }
     // WARNING: NO JUMP BACK !! (don't know why ?)
 }
@@ -510,17 +602,15 @@ fn normal_mode<'a>(
     // FORCE DEPLOYEMENT
     ws.write(brightness(once(RGB8::new(0, 255, 0)), 100))
         .unwrap();
-    
+
     let mut delay = timer.count_down();
     delay.start(2.secs());
     let _ = nb::block!(delay.wait());
 
     if modeselect_pin.is_low().unwrap() {
-        servo_pwm.set_duty(servo_open);
         logger.write_event_log("FORCED DEPLOYEMENT");
-        critical_section::with(|cs| {
-            IS_DEPLOYED.borrow(cs).set(true);
-        });
+        servo_pwm.set_duty(servo_open);
+        critical_section::with(|cs| IS_DEPLOYED.borrow(cs).set(true));
         loop {
             // Turn off the LED (black)
             ws.write(brightness(once(RGB8::new(0, 0, 0)), 0)).unwrap();
@@ -634,6 +724,7 @@ fn normal_mode<'a>(
     if !critical_section::with(|cs| IS_DEPLOYED.borrow(cs).get()) {
         logger.write_event_log("DEPLOYED BY ALTI");
         servo_pwm.set_duty(servo_open);
+        critical_section::with(|cs| IS_DEPLOYED.borrow(cs).set(true))
     }
 
     buffer_head_index = 0;

@@ -8,7 +8,7 @@ const XIP_BASE: u32 = 0x10000000;
 const PAGE_SIZE: u32 = 256;
 const SECTOR_SIZE: u32 = 4 * 1024;
 const FLASH_SIZE: u32 = 2 * 1024 * 1024;
-const PROGRAM_SIZE: u32 = SECTOR_SIZE * 64; // 262KB
+const PROGRAM_SIZE: u32 = SECTOR_SIZE * 66; // 270KB
 
 pub struct RpRom;
 impl Storage for RpRom {
