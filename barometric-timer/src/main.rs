@@ -106,7 +106,7 @@ const BUFFER_MAX_LEN: usize = 32;
 const MAX_DELAY: MicrosDurationU32 = MicrosDurationU32::millis(4500);
 
 /// Minimum altitude variation to detect a launch.
-const ALTITUDE_THRESHOLD: f32 = 15.0_f32;
+const ALTITUDE_THRESHOLD: f32 = 0.0_f32;
 /// Minimum vertical speed below which the paracute will be triggered. Meaning we are close to
 /// apoapsis.
 const VERTICAL_SPEED_THRESHOLD: f32 = 3.0;
@@ -316,6 +316,7 @@ fn main() -> ! {
 enum FrameLog {
     Event = 1,
     BMP = 2,
+    VerticalSpeed = 3,
 }
 struct Logger<'a> {
     fs: &'a Filesystem<'a, RpRom>,
@@ -400,7 +401,7 @@ impl<'a> Logger<'a> {
             .unwrap();
     }
 
-    pub fn write_bmp_log(&mut self, temp: i32, pressure: i32, altitude: f32) {
+    pub fn write_bmp_log(&mut self, temp: f32, pressure: f32, altitude: f32) {
         // Baked log path for farter execution
         if self.baked_log_path.is_empty() {
             let mut temp_path: String = String::new();
@@ -420,7 +421,7 @@ impl<'a> Logger<'a> {
                     temp_str.push(b'|');
                     temp_str.extend_from_slice(&temp.to_le_bytes());
                     temp_str.extend_from_slice(&pressure.to_le_bytes());
-                    temp_str.extend_from_slice(&altitude.to_be_bytes());
+                    temp_str.extend_from_slice(&altitude.to_le_bytes());
                     temp_str.push(b'\0');
                     file.write(&temp_str)?;
                     Ok(())
@@ -443,11 +444,11 @@ impl<'a> Logger<'a> {
                 &Path::from_str_with_nul(self.baked_log_path.as_str()),
                 |file| {
                     let mut temp_str = Vec::<u8>::new();
-                    temp_str.push(FrameLog::BMP as u8);
+                    temp_str.push(FrameLog::VerticalSpeed as u8);
                     temp_str.push(b'|');
                     temp_str.extend_from_slice(&self.timer.get_counter().ticks().to_le_bytes());
                     temp_str.push(b'|');
-                    temp_str.extend_from_slice(&speed.to_be_bytes());
+                    temp_str.extend_from_slice(&speed.to_le_bytes());
                     temp_str.push(b'\0');
                     file.write(&temp_str)?;
                     Ok(())
@@ -630,23 +631,22 @@ fn normal_mode<'a>(
         .unwrap();
     let mut buffer_head_index: usize = 0;
     let mut buffer_len: usize = 0;
-    let mut circ_buffer = [0u32; BUFFER_MAX_LEN * 3];
-    let mut sea_level_pressure = 0;
+    let mut circ_buffer = [0f32; BUFFER_MAX_LEN * 3];
+    let mut sea_level_pressure = 0.0;
     loop {
-        let temp = bmp.read_temperature(&mut i2c).unwrap();
-        let pressure = bmp.read_pressure(&mut i2c).unwrap();
-        if sea_level_pressure == 0 {
+        let temp = bmp.read_temperature(&mut i2c).unwrap() as f32 / 100f32;
+        let pressure = bmp.read_pressure(&mut i2c).unwrap() as f32 / 256f32;
+        if sea_level_pressure == 0.0 {
             sea_level_pressure = pressure;
         }
-        let altitude: f32 =
-            44330.0 * (1.0 - ((pressure as f32) / (sea_level_pressure as f32)).powf(0.1903));
+        let altitude: f32 = 44330.0 * (1.0 - (pressure / sea_level_pressure).powf(0.1903));
 
-        circ_buffer[buffer_head_index] = temp as u32;
-        circ_buffer[buffer_head_index + 1] = pressure as u32;
-        circ_buffer[buffer_head_index + 2] = altitude.to_bits();
+        circ_buffer[buffer_head_index] = temp;
+        circ_buffer[buffer_head_index + 1] = pressure;
+        circ_buffer[buffer_head_index + 2] = altitude;
 
         buffer_head_index = (buffer_head_index + 3) % BUFFER_MAX_LEN * 3 as usize;
-        if buffer_len < BUFFER_MAX_LEN as usize {
+        if buffer_len < BUFFER_MAX_LEN * 3 as usize {
             buffer_len += 3;
         };
 
@@ -680,27 +680,22 @@ fn normal_mode<'a>(
 
     logger.write_event_log("SAVE CIRCULAR BUFFER");
     for i in ((buffer_head_index - buffer_len)..buffer_head_index).step_by(3) {
-        let i = i % BUFFER_MAX_LEN;
-        logger.write_bmp_log(
-            circ_buffer[i] as i32,
-            circ_buffer[i + 1] as i32,
-            f32::from_bits(circ_buffer[i + 2]),
-        );
+        let i = i % BUFFER_MAX_LEN * 3;
+        logger.write_bmp_log(circ_buffer[i], circ_buffer[i + 1], circ_buffer[i + 2]);
     }
 
     logger.write_event_log("START MAIN LOOP");
-    let mut circ_buffer = [(0u64, 0f32); VERTICAL_SPEED_AVG_WINDOW];
+    let mut circ_buffer = [(0f32, 0f32); VERTICAL_SPEED_AVG_WINDOW];
     buffer_head_index = 0;
     buffer_len = 0;
     let mut apoapsis = 0.0f32;
     while !critical_section::with(|cs| IS_DEPLOYED.borrow(cs).get()) {
-        let temp = bmp.read_temperature(&mut i2c).unwrap();
-        let pressure = bmp.read_pressure(&mut i2c).unwrap();
-        let altitude: f32 =
-            44330.0 * (1.0 - ((pressure as f32) / (sea_level_pressure as f32)).powf(0.1903));
+        let temp = bmp.read_temperature(&mut i2c).unwrap() as f32 / 100f32;
+        let pressure = bmp.read_pressure(&mut i2c).unwrap() as f32 / 256f32;
+        let altitude: f32 = 44330.0 * (1.0 - (pressure / sea_level_pressure).powf(0.1903));
         logger.write_bmp_log(temp, pressure, altitude);
 
-        circ_buffer[buffer_head_index] = (timer.get_counter().ticks(), altitude);
+        circ_buffer[buffer_head_index] = (timer.get_counter().ticks() as f32, altitude);
         buffer_head_index = (buffer_head_index + 1) % VERTICAL_SPEED_AVG_WINDOW;
         if buffer_len < VERTICAL_SPEED_AVG_WINDOW {
             buffer_len += 1;
@@ -711,9 +706,15 @@ fn normal_mode<'a>(
 
         let mean_speed = circ_buffer
             .windows(2)
-            .map(|arr| (arr[1].1 - arr[0].1) / (arr[1].0 - arr[0].0) as f32)
+            .map(|arr| {
+                if arr[1].0 == 0.0 || arr[0].0 == 0.0 {
+                    0.0
+                } else {
+                    (arr[1].1 - arr[0].1) / (arr[1].0 - arr[0].0)
+                }
+            })
             .sum::<f32>()
-            / (VERTICAL_SPEED_AVG_WINDOW - 1) as f32;
+            / ((VERTICAL_SPEED_AVG_WINDOW - 1) as f32);
         logger.write_speed_log(mean_speed);
 
         if mean_speed < VERTICAL_SPEED_THRESHOLD {
@@ -730,13 +731,12 @@ fn normal_mode<'a>(
     buffer_head_index = 0;
     buffer_len = 0;
     loop {
-        let temp = bmp.read_temperature(&mut i2c).unwrap();
-        let pressure = bmp.read_pressure(&mut i2c).unwrap();
-        let altitude: f32 =
-            44330.0 * (1.0 - ((pressure as f32) / (sea_level_pressure as f32)).powf(0.1903));
+        let temp = bmp.read_temperature(&mut i2c).unwrap() as f32 / 100f32;
+        let pressure = bmp.read_pressure(&mut i2c).unwrap() as f32 / 256f32;
+        let altitude: f32 = 44330.0 * (1.0 - (pressure / sea_level_pressure).powf(0.1903));
         logger.write_bmp_log(temp, pressure, altitude);
 
-        circ_buffer[buffer_head_index] = (timer.get_counter().ticks(), altitude);
+        circ_buffer[buffer_head_index] = (timer.get_counter().ticks() as f32, altitude);
         buffer_head_index = (buffer_head_index + 1) % VERTICAL_SPEED_AVG_WINDOW;
         if buffer_len < VERTICAL_SPEED_AVG_WINDOW {
             buffer_len += 1;
@@ -747,9 +747,15 @@ fn normal_mode<'a>(
 
         let mean_speed = circ_buffer
             .windows(2)
-            .map(|arr| (arr[1].1 - arr[0].1) / (arr[1].0 - arr[0].0) as f32)
+            .map(|arr| {
+                if arr[1].0 == 0.0 || arr[0].0 == 0.0 {
+                    0.0
+                } else {
+                    (arr[1].1 - arr[0].1) / (arr[1].0 - arr[0].0)
+                }
+            })
             .sum::<f32>()
-            / (VERTICAL_SPEED_AVG_WINDOW - 1) as f32;
+            / ((VERTICAL_SPEED_AVG_WINDOW - 1) as f32);
         logger.write_speed_log(mean_speed);
 
         if altitude < (apoapsis - TOUCHDOWN_APOAPSIS_OFFSET)
