@@ -106,7 +106,7 @@ const BUFFER_MAX_LEN: usize = 32;
 const MAX_DELAY: MicrosDurationU32 = MicrosDurationU32::millis(4500);
 
 /// Minimum altitude variation to detect a launch.
-const ALTITUDE_THRESHOLD: f32 = 0.0_f32;
+const ALTITUDE_THRESHOLD: f32 = 15.0_f32;
 /// Minimum vertical speed below which the paracute will be triggered. Meaning we are close to
 /// apoapsis.
 const VERTICAL_SPEED_THRESHOLD: f32 = 3.0;
