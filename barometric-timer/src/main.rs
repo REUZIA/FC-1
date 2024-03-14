@@ -724,6 +724,7 @@ fn normal_mode<'a>(
     }
     if !critical_section::with(|cs| IS_DEPLOYED.borrow(cs).get()) {
         logger.write_event_log("DEPLOYED BY ALTI");
+        timer_alarm.disable_interrupt();
         servo_pwm.set_duty(servo_open);
         critical_section::with(|cs| IS_DEPLOYED.borrow(cs).set(true))
     }
@@ -765,6 +766,8 @@ fn normal_mode<'a>(
             break;
         }
     }
+    ws.write(brightness(once(RGB8::new(255, 255, 0)), 100))
+        .unwrap();
 }
 
 fn cli_mode(
